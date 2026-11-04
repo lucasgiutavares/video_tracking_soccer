@@ -684,45 +684,91 @@ def draw_pitch_keypoints(img: np.ndarray, mapper: PitchMapper) -> None:
 
 def draw_radar(img: np.ndarray, mapper: PitchMapper, det: Detections, names: list[str],
                teams: np.ndarray, team_colors: list | None, holder: int | None) -> None:
-    """Minimapa do campo no canto inferior direito com jogadores, árbitros e bola."""
+    """Painel no canto inferior direito com a posição dos atletas no campo (vista de cima).
+
+    Jogadores: círculo na cor da equipe (contorno vermelho = jogador com a bola).
+    Goleiros: quadrado na cor da equipe. Árbitros: círculo preto. Bola: círculo amarelo.
+    """
     H, W = img.shape[:2]
     s = H / 1080
-    pad = 3.0  # metros de margem fora das linhas
-    m, rw = int(20 * s), int(460 * s)
-    scale = rw / (PITCH_LENGTH + 2 * pad)
-    rh = int((PITCH_WIDTH + 2 * pad) * scale)
-    x0, y0 = W - m - rw, H - m - rh
-    roi = img[y0:y0 + rh, x0:x0 + rw]
-    roi[:] = cv2.addWeighted(roi, 0.3, np.full_like(roi, (40, 110, 40)), 0.7, 0)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    t1, t2 = max(1, int(2 * s)), max(1, int(1.5 * s))
+    m, pw = int(20 * s), int(480 * s)
+    inner = int(14 * s)                      # margem interna do painel
+    title_h, legend_h = int(44 * s), int(34 * s)
+    pad = 3.0                                # metros de gramado fora das linhas
+    fw = pw - 2 * inner                      # largura do desenho do campo
+    scale = fw / (PITCH_LENGTH + 2 * pad)
+    fh = int((PITCH_WIDTH + 2 * pad) * scale)
+    ph = title_h + fh + legend_h + inner
+    x0, y0 = W - m - pw, H - m - ph
+    if x0 < 0 or y0 < 0:
+        return
+    roi = img[y0:y0 + ph, x0:x0 + pw]
+    roi[:] = cv2.addWeighted(roi, 0.35, np.full_like(roi, 20), 0.65, 0)
+    cv2.putText(img, "POSICIONAMENTO", (x0 + inner, y0 + int(32 * s)), font, 0.75 * s,
+                (255, 255, 255), t1, cv2.LINE_AA)
+
+    fx0, fy0 = x0 + inner, y0 + title_h
+    field = img[fy0:fy0 + fh, fx0:fx0 + fw]
+    field[:] = cv2.addWeighted(field, 0.25, np.full_like(field, (45, 120, 45)), 0.75, 0)
 
     def px(p) -> tuple[int, int]:
-        return int(x0 + (p[0] + pad) * scale), int(y0 + (p[1] + pad) * scale)
+        return int(fx0 + (p[0] + pad) * scale), int(fy0 + (p[1] + pad) * scale)
 
     line = (235, 235, 235)
     for a, b in PITCH_EDGES:
         cv2.line(img, px(PITCH_VERTICES[a - 1]), px(PITCH_VERTICES[b - 1]), line, 1, cv2.LINE_AA)
     cv2.circle(img, px((PITCH_LENGTH / 2, PITCH_WIDTH / 2)), int(CENTRE_CIRCLE_R * scale), line, 1, cv2.LINE_AA)
+    for spot in (PENALTY_SPOT, PITCH_LENGTH - PENALTY_SPOT):
+        cv2.circle(img, px((spot, PITCH_WIDTH / 2)), max(1, int(1.5 * s)), line, -1, cv2.LINE_AA)
+
+    r = max(3, int(6 * s))
+    ref_color = CLASS_COLORS["referee"]
+    ball_color = CLASS_COLORS["ball"]
+
+    def marker(c, kind: str, color, ring=(0, 0, 0), ring_w=1) -> None:
+        if kind == "goalkeeper":
+            cv2.rectangle(img, (c[0] - r, c[1] - r), (c[0] + r, c[1] + r), color, -1)
+            cv2.rectangle(img, (c[0] - r, c[1] - r), (c[0] + r, c[1] + r), ring, ring_w)
+        elif kind == "ball":
+            cv2.circle(img, c, max(2, r - 2), color, -1, cv2.LINE_AA)
+            cv2.circle(img, c, max(2, r - 2), (0, 0, 0), 1, cv2.LINE_AA)
+        else:
+            cv2.circle(img, c, r, color, -1, cv2.LINE_AA)
+            cv2.circle(img, c, r, ring, ring_w, cv2.LINE_AA)
+
+    # legenda
+    ly = y0 + title_h + fh + int(24 * s)
+    items = []
+    if team_colors:
+        items += [("player", team_colors[0], TEAM_NAMES[0]), ("player", team_colors[1], TEAM_NAMES[1])]
+    else:
+        items += [("player", CLASS_COLORS["player"], "Jogador")]
+    items += [("referee", ref_color, "Arbitro"), ("ball", ball_color, "Bola")]
+    lx = x0 + inner + r
+    for kind, color, label in items:
+        marker((lx, ly - int(6 * s)), kind, color, (255, 255, 255) if kind == "referee" else (0, 0, 0))
+        cv2.putText(img, label, (lx + r + int(6 * s), ly), font, 0.5 * s, (255, 255, 255), t2, cv2.LINE_AA)
+        (tw, _), _ = cv2.getTextSize(label, font, 0.5 * s, t2)
+        lx += r + int(6 * s) + tw + int(22 * s) + r
+
     if not mapper.valid:
-        cv2.putText(img, "sem homografia", (x0 + int(10 * s), y0 + int(24 * s)), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6 * s, (255, 255, 255), max(1, int(1.5 * s)), cv2.LINE_AA)
+        cv2.putText(img, "campo nao identificado", (fx0 + int(10 * s), fy0 + int(26 * s)), font,
+                    0.6 * s, (255, 255, 255), t2, cv2.LINE_AA)
         return
     pts = mapper.to_pitch(anchor_points(det, names))
-    r = max(3, int(6 * s))
     order = sorted(range(len(det)), key=lambda i: class_name(names, int(det.class_id[i])) == "ball")
-    for i in order:  # bola por último, por cima dos jogadores
+    for i in order:  # bola por último, por cima dos atletas
         x, y = pts[i]
         if not (-pad <= x <= PITCH_LENGTH + pad and -pad <= y <= PITCH_WIDTH + pad):
             continue
         name = class_name(names, int(det.class_id[i]))
         team = int(teams[i]) if i < len(teams) else -1
         color = team_colors[team] if team >= 0 and team_colors else CLASS_COLORS.get(name, FALLBACK_COLOR)
-        c = px((x, y))
-        if name == "ball":
-            cv2.circle(img, c, max(2, r - 2), CLASS_COLORS["ball"], -1, cv2.LINE_AA)
-            cv2.circle(img, c, max(2, r - 2), (0, 0, 0), 1, cv2.LINE_AA)
-            continue
-        cv2.circle(img, c, r, color, -1, cv2.LINE_AA)
-        cv2.circle(img, c, r, (0, 0, 255) if i == holder else (0, 0, 0), 2 if i == holder else 1, cv2.LINE_AA)
+        ring, ring_w = ((0, 0, 255), 2) if i == holder else \
+            (((255, 255, 255), 1) if name == "referee" else ((0, 0, 0), 1))
+        marker(px((x, y)), name, color, ring, ring_w)
 
 
 # --------------------------------------------------------------------------- #

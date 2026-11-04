@@ -88,7 +88,10 @@ Saídas com `--pitch`:
   dos pés; para a bola é o centro da caixa, então uma bola no alto cai no gramado atrás dela.
 - `<nome>_pitch.csv`: por quadro analisado, `frame, timestamp, keypoints, homography, fresh, h11..h33`.
   `homography = 1` quando há homografia válida e `fresh = 0` quando ela foi herdada do quadro anterior.
-- Minimapa do campo no canto inferior direito do vídeo, com jogadores nas cores das equipes, árbitros e bola.
+- Painel **POSICIONAMENTO** no canto inferior direito do vídeo: vista de cima do campo com a
+  posição dos atletas. Jogadores são círculos na cor da equipe, goleiros são quadrados, árbitros
+  são círculos pretos e a bola é amarela. O jogador com a bola tem contorno vermelho. Uma legenda
+  fica abaixo do campo. Quando o campo não é identificado no quadro, o painel avisa.
 
 | opção | efeito |
 |---|---|
