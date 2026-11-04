@@ -250,15 +250,30 @@ def class_name(names: list[str], cid: int) -> str:
     return names[cid] if 0 <= cid < len(names) else f"class_{cid}"
 
 
-def annotate(frame: np.ndarray, det: Detections, names: list[str], show_conf: bool = True) -> np.ndarray:
+def text_color_for(bgr: tuple[int, int, int]) -> tuple[int, int, int]:
+    """Preto ou branco, o que tiver mais contraste com a cor de fundo."""
+    b, g, r = bgr
+    return (0, 0, 0) if 0.299 * r + 0.587 * g + 0.114 * b > 140 else (255, 255, 255)
+
+
+def annotate(frame: np.ndarray, det: Detections, names: list[str], show_conf: bool = True,
+             teams: np.ndarray | None = None, team_colors: list | None = None,
+             holder: int | None = None) -> np.ndarray:
     out = frame.copy()
     h = out.shape[0]
     thick = max(2, h // 540)
     font_scale = max(0.5, h / 1600)
-    for (x1, y1, x2, y2), conf, cid in zip(det.xyxy, det.confidence, det.class_id):
+    for i, ((x1, y1, x2, y2), conf, cid) in enumerate(zip(det.xyxy, det.confidence, det.class_id)):
         name = class_name(names, int(cid))
         color = CLASS_COLORS.get(name, FALLBACK_COLOR)
+        team = int(teams[i]) if teams is not None and i < len(teams) else -1
+        if team >= 0 and team_colors:
+            color = team_colors[team]
         x1, y1, x2, y2 = map(int, (x1, y1, x2, y2))
+        if i == holder:
+            # jogador com a bola: elipse vermelha nos pés
+            cv2.ellipse(out, ((x1 + x2) // 2, y2), (max(12, (x2 - x1) // 2 + 6), max(5, (x2 - x1) // 5 + 3)),
+                        0, 0, 360, (0, 0, 255), thick + 1, cv2.LINE_AA)
         if name == "ball":
             # triângulo acima da bola — mais visível que uma caixa minúscula
             cx, s = (x1 + x2) // 2, max(10, h // 90)
@@ -267,14 +282,220 @@ def annotate(frame: np.ndarray, det: Detections, names: list[str], show_conf: bo
             cv2.polylines(out, [pts], True, (0, 0, 0), max(1, thick // 2))
             continue
         cv2.rectangle(out, (x1, y1), (x2, y2), color, thick)
-        label = LABELS_PT.get(name, name) + (f" {conf:.2f}" if show_conf else "")
+        label = LABELS_PT.get(name, name) + (f" {TEAM_SHORT[team]}" if team >= 0 else "") \
+            + (f" {conf:.2f}" if show_conf else "")
         (tw, th), base = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thick)
         ty = max(y1, th + base + 2)
         cv2.rectangle(out, (x1, ty - th - base - 2), (x1 + tw + 4, ty), color, -1)
-        txt_color = (255, 255, 255) if name in ("referee", "player") else (0, 0, 0)
+        if team >= 0:
+            txt_color = text_color_for(color)
+        else:
+            txt_color = (255, 255, 255) if name in ("referee", "player") else (0, 0, 0)
         cv2.putText(out, label, (x1 + 2, ty - base), cv2.FONT_HERSHEY_SIMPLEX, font_scale,
                     txt_color, thick, cv2.LINE_AA)
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Equipes e posse de bola
+# --------------------------------------------------------------------------- #
+# O modelo não distingue equipes: elas são separadas pela cor da camisa
+# (k-means com 2 grupos sobre a cor do tronco de cada jogador).
+TEAM_NAMES = ["Equipe A", "Equipe B"]
+TEAM_SHORT = ["A", "B"]
+# Peso dos canais L, a, b no agrupamento — o brilho varia com sombra/iluminação,
+# então pesa menos que a tonalidade.
+LAB_WEIGHTS = np.array([0.5, 1.0, 1.0], np.float32)
+
+
+def jersey_feature(frame: np.ndarray, box: np.ndarray) -> np.ndarray | None:
+    """Cor mediana (Lab) do tronco do jogador, ignorando pixels de grama."""
+    x1, y1, x2, y2 = box
+    w, h = x2 - x1, y2 - y1
+    if w < 4 or h < 8:
+        return None
+    H, W = frame.shape[:2]
+    cx1, cx2 = int(max(0, x1 + 0.2 * w)), int(min(W, x2 - 0.2 * w))
+    cy1, cy2 = int(max(0, y1 + 0.15 * h)), int(min(H, y1 + 0.5 * h))
+    if cx2 - cx1 < 2 or cy2 - cy1 < 2:
+        return None
+    crop = frame[cy1:cy2, cx1:cx2]
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV).reshape(-1, 3)
+    lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB).reshape(-1, 3)
+    grass = (hsv[:, 0] >= 35) & (hsv[:, 0] <= 85) & (hsv[:, 1] > 50) & (hsv[:, 2] > 40)
+    px = lab[~grass]
+    if len(px) < max(4, 0.15 * len(lab)):
+        px = lab  # camisa verde (ou recorte só de grama): usa tudo
+    return np.median(px, axis=0).astype(np.float32)
+
+
+class TeamClassifier:
+    """Agrupa jogadores em 2 equipes pela cor da camisa."""
+
+    def __init__(self):
+        self.centers: np.ndarray | None = None
+        self.colors: list[tuple[int, int, int]] = [(255, 255, 255), (0, 0, 255)]
+
+    @property
+    def fitted(self) -> bool:
+        return self.centers is not None
+
+    def fit(self, feats: list[np.ndarray]) -> None:
+        data = np.stack(feats).astype(np.float32) * LAB_WEIGHTS
+        crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.2)
+        _, _, centers = cv2.kmeans(data, 2, None, crit, 10, cv2.KMEANS_PP_CENTERS)
+        # ordem estável entre execuções: equipe A = camisa mais clara
+        self.centers = centers[np.argsort(-centers[:, 0])]
+        lab = (self.centers / LAB_WEIGHTS).clip(0, 255).astype(np.uint8).reshape(1, 2, 3)
+        self.colors = [tuple(int(c) for c in v) for v in cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)[0]]
+
+    def predict(self, frame: np.ndarray, det: Detections, names: list[str]) -> np.ndarray:
+        """Equipe (0/1) de cada detecção; -1 para bola, árbitro ou indefinido."""
+        teams = np.full(len(det), -1, int)
+        if not self.fitted or len(det) == 0:
+            return teams
+        cls = [class_name(names, int(c)) for c in det.class_id]
+        for i, name in enumerate(cls):
+            if name == "player":
+                f = jersey_feature(frame, det.xyxy[i])
+                if f is not None:
+                    teams[i] = int(np.argmin(np.linalg.norm(self.centers - f * LAB_WEIGHTS, axis=1)))
+        # Goleiro usa uniforme diferente: vai para a equipe cujos jogadores estão,
+        # em média, mais perto dele no eixo horizontal (ele fica no lado da sua equipe).
+        cx = (det.xyxy[:, 0] + det.xyxy[:, 2]) / 2
+        means = [cx[teams == t].mean() if (teams == t).any() else None for t in (0, 1)]
+        for i, name in enumerate(cls):
+            if name == "goalkeeper":
+                opts = [(abs(cx[i] - m), t) for t, m in enumerate(means) if m is not None]
+                if opts:
+                    teams[i] = min(opts)[1]
+        return teams
+
+
+class PossessionTracker:
+    """Posse de bola: o jogador mais próximo da bola (dentro de `max_dist` px) define a equipe.
+
+    A posse fica com a última equipe que teve a bola. Ela só troca quando o modelo
+    vê a outra equipe com a bola por pelo menos `min_seconds` segundos seguidos
+    (evita trocas por ruído). Enquanto a bola não é identificada (ou está longe de
+    todos), a posse continua com a última equipe e a contagem da troca fica pausada.
+    A contagem só zera quando a equipe com a posse volta a ser vista com a bola.
+    Antes da primeira posse, o tempo não é contado para ninguém.
+    """
+
+    def __init__(self, max_dist: float, min_seconds: float):
+        self.max_dist = max_dist
+        self.min_seconds = max(0.0, min_seconds)
+        self.team = -1
+        self.candidate, self.streak = -1, 0.0  # equipe desafiante e segundos seguidos com a bola
+        self.seconds = [0.0, 0.0]
+        self.holder: int | None = None
+
+    def update(self, det: Detections, teams: np.ndarray, names: list[str], dt: float) -> int:
+        """Atualiza com um quadro analisado; devolve a equipe junto à bola (-1 se ninguém)."""
+        self.holder = None
+        near = -1
+        is_ball = np.array([class_name(names, int(c)) == "ball" for c in det.class_id], bool)
+        has_team = teams >= 0
+        if is_ball.any() and has_team.any():
+            b = np.flatnonzero(is_ball)[np.argmax(det.confidence[is_ball])]
+            bx, by = (det.xyxy[b, 0] + det.xyxy[b, 2]) / 2, (det.xyxy[b, 1] + det.xyxy[b, 3]) / 2
+            idx = np.flatnonzero(has_team)
+            boxes = det.xyxy[idx]
+            # distância do centro da bola até a caixa do jogador (0 se estiver dentro)
+            dx = np.maximum.reduce([boxes[:, 0] - bx, np.zeros(len(idx)), bx - boxes[:, 2]])
+            dy = np.maximum.reduce([boxes[:, 1] - by, np.zeros(len(idx)), by - boxes[:, 3]])
+            d = np.hypot(dx, dy)
+            j = int(np.argmin(d))
+            if d[j] <= self.max_dist:
+                self.holder = int(idx[j])
+                near = int(teams[self.holder])
+        if near >= 0:
+            if self.team < 0:
+                self.team = near  # primeira posse: assume na hora
+            elif near == self.team:
+                self.candidate, self.streak = -1, 0.0
+            else:
+                if near == self.candidate:
+                    self.streak += dt
+                else:
+                    self.candidate, self.streak = near, dt
+                if self.streak >= self.min_seconds - 1e-9:
+                    self.team = near
+                    self.candidate, self.streak = -1, 0.0
+        if self.team >= 0:
+            self.seconds[self.team] += dt
+        return near
+
+    def percentages(self) -> list[float]:
+        total = sum(self.seconds)
+        return [100 * s / total for s in self.seconds] if total > 0 else [0.0, 0.0]
+
+
+def fmt_time(seconds: float) -> str:
+    m, s = divmod(int(round(seconds)), 60)
+    return f"{m:02d}:{s:02d}"
+
+
+def draw_possession_panel(img: np.ndarray, tracker: PossessionTracker, colors: list) -> None:
+    """Painel no canto inferior esquerdo: tempo e % de posse de cada equipe."""
+    H = img.shape[0]
+    s = H / 1080
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    m, pw, ph = int(20 * s), int(430 * s), int(165 * s)
+    x0, y0 = m, H - m - ph
+    roi = img[y0:y0 + ph, x0:x0 + pw]
+    roi[:] = cv2.addWeighted(roi, 0.35, np.full_like(roi, 20), 0.65, 0)
+    t1, t2 = max(1, int(2 * s)), max(1, int(1.5 * s))
+    cv2.putText(img, "POSSE DE BOLA", (x0 + int(14 * s), y0 + int(32 * s)), font, 0.75 * s,
+                (255, 255, 255), t1, cv2.LINE_AA)
+    pct = tracker.percentages()
+    has_data = sum(tracker.seconds) > 0
+    for t in (0, 1):
+        ry = y0 + int((68 + 38 * t) * s)
+        sw = int(22 * s)
+        cv2.rectangle(img, (x0 + int(14 * s), ry - sw), (x0 + int(14 * s) + sw, ry), colors[t], -1)
+        cv2.rectangle(img, (x0 + int(14 * s), ry - sw), (x0 + int(14 * s) + sw, ry), (255, 255, 255), 1)
+        label = TEAM_NAMES[t] + ("  <" if tracker.team == t else "")
+        cv2.putText(img, label, (x0 + int(46 * s), ry - int(3 * s)), font, 0.7 * s,
+                    (255, 255, 255), t2, cv2.LINE_AA)
+        cv2.putText(img, fmt_time(tracker.seconds[t]), (x0 + int(225 * s), ry - int(3 * s)), font,
+                    0.7 * s, (255, 255, 255), t2, cv2.LINE_AA)
+        p = f"{pct[t]:.0f}%" if has_data else "--"
+        (tw, _), _ = cv2.getTextSize(p, font, 0.8 * s, t1)
+        cv2.putText(img, p, (x0 + pw - int(14 * s) - tw, ry - int(2 * s)), font, 0.8 * s,
+                    (255, 255, 255), t1, cv2.LINE_AA)
+    # barra dividida pela porcentagem
+    bx1, bx2 = x0 + int(14 * s), x0 + pw - int(14 * s)
+    by1, by2 = y0 + ph - int(36 * s), y0 + ph - int(18 * s)
+    if has_data:
+        split = bx1 + int((bx2 - bx1) * pct[0] / 100)
+        cv2.rectangle(img, (bx1, by1), (split, by2), colors[0], -1)
+        cv2.rectangle(img, (split, by1), (bx2, by2), colors[1], -1)
+    else:
+        cv2.rectangle(img, (bx1, by1), (bx2, by2), (90, 90, 90), -1)
+    cv2.rectangle(img, (bx1, by1), (bx2, by2), (255, 255, 255), 1)
+
+
+def calibrate_teams(cap, detect, start: int, end: int, n_frames: int, names: list[str]) -> TeamClassifier:
+    """Amostra quadros espalhados no trecho, coleta cores de camisa e ajusta o k-means."""
+    feats = []
+    for i in np.unique(np.linspace(start, end - 1, max(1, n_frames)).astype(int)):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(i))
+        ok, frame = cap.read()
+        if not ok:
+            continue
+        det = detect(frame)
+        for box, cid in zip(det.xyxy, det.class_id):
+            if class_name(names, int(cid)) == "player":
+                f = jersey_feature(frame, box)
+                if f is not None:
+                    feats.append(f)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+    clf = TeamClassifier()
+    if len(feats) >= 6:
+        clf.fit(feats)
+    return clf
 
 
 # --------------------------------------------------------------------------- #
@@ -317,7 +538,9 @@ class VideoSink:
 # Pipeline
 # --------------------------------------------------------------------------- #
 CSV_FIELDS = ["frame", "timestamp", "class_id", "class_name", "confidence",
-              "x1", "y1", "x2", "y2", "width", "height", "center_x", "center_y", "area"]
+              "x1", "y1", "x2", "y2", "width", "height", "center_x", "center_y", "area", "team"]
+POSSESSION_FIELDS = ["frame", "timestamp", "ball_detected", "team_near_ball", "possession_team",
+                     "seconds_A", "seconds_B", "pct_A", "pct_B"]
 
 
 def parse_class_thresholds(items: list[str]) -> dict[str, float]:
@@ -377,6 +600,25 @@ def run(args: argparse.Namespace, detector=None) -> dict:
     csv_path = out_dir / f"{stem}_detections.csv"
     video_path = out_dir / f"{stem}_annotated.mp4"
 
+    def detect(frame: np.ndarray) -> Detections:
+        det = (detect_tiled(detector, frame, base_thr, args.tiles, args.tile_overlap)
+               if args.tiles > 1 else detector(frame, base_thr))
+        det = det.filter(det.confidence >= args.threshold) if not per_class else \
+            apply_class_thresholds(det, names, {n: per_class.get(n, args.threshold) for n in names})
+        return keep_best_ball(det, names) if args.single_ball else det
+
+    teams_clf, tracker, poss_path = None, None, None
+    if not args.no_possession:
+        print(f"[posse] calibrando cores das equipes em {args.team_calib_frames} quadros...")
+        teams_clf = calibrate_teams(cap, detect, start, end, args.team_calib_frames, names)
+        if teams_clf.fitted:
+            print(f"[posse] cores (BGR): A={teams_clf.colors[0]}  B={teams_clf.colors[1]}")
+            tracker = PossessionTracker(args.possession_distance * H / 1080, args.possession_min_seconds)
+            poss_path = out_dir / f"{stem}_possession.csv"
+        else:
+            print("[posse] jogadores insuficientes para separar as equipes; posse desativada")
+            teams_clf = None
+
     sink = None
     if not args.no_video:
         out_w = min(args.output_width or W, W)
@@ -388,7 +630,14 @@ def run(args: argparse.Namespace, detector=None) -> dict:
     frames_done = 0
     infer_time = 0.0
     last = Detections.empty()
+    last_teams = np.zeros(0, int)
     t0 = time.time()
+    dt = args.frame_skip / fps  # segundos de vídeo representados por quadro analisado
+
+    poss_fh = open(poss_path, "w", newline="") if poss_path else None
+    poss_writer = csv.DictWriter(poss_fh, fieldnames=POSSESSION_FIELDS) if poss_fh else None
+    if poss_writer:
+        poss_writer.writeheader()
 
     with open(csv_path, "w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=CSV_FIELDS)
@@ -400,17 +649,24 @@ def run(args: argparse.Namespace, detector=None) -> dict:
             run_model = (idx - start) % args.frame_skip == 0
             if run_model:
                 ti = time.time()
-                det = (detect_tiled(detector, frame, base_thr, args.tiles, args.tile_overlap)
-                       if args.tiles > 1 else detector(frame, base_thr))
+                det = detect(frame)
                 infer_time += time.time() - ti
-                det = det.filter(det.confidence >= args.threshold) if not per_class else \
-                    apply_class_thresholds(det, names, {n: per_class.get(n, args.threshold) for n in names})
-                if args.single_ball:
-                    det = keep_best_ball(det, names)
                 last = det
+                last_teams = teams_clf.predict(frame, det, names) if teams_clf else np.full(len(det), -1)
                 frames_done += 1
                 ts = idx / fps
-                for (x1, y1, x2, y2), conf, cid in zip(det.xyxy, det.confidence, det.class_id):
+                if tracker:
+                    near = tracker.update(det, last_teams, names, dt)
+                    pct = tracker.percentages()
+                    poss_writer.writerow({
+                        "frame": idx, "timestamp": round(ts, 3),
+                        "ball_detected": int(any(class_name(names, int(c)) == "ball" for c in det.class_id)),
+                        "team_near_ball": TEAM_SHORT[near] if near >= 0 else "",
+                        "possession_team": TEAM_SHORT[tracker.team] if tracker.team >= 0 else "",
+                        "seconds_A": round(tracker.seconds[0], 3), "seconds_B": round(tracker.seconds[1], 3),
+                        "pct_A": round(pct[0], 2), "pct_B": round(pct[1], 2),
+                    })
+                for k, ((x1, y1, x2, y2), conf, cid) in enumerate(zip(det.xyxy, det.confidence, det.class_id)):
                     name = class_name(names, int(cid))
                     counts[name] += 1
                     w, h = x2 - x1, y2 - y1
@@ -422,9 +678,16 @@ def run(args: argparse.Namespace, detector=None) -> dict:
                         "width": round(float(w), 1), "height": round(float(h), 1),
                         "center_x": round(float(x1 + w / 2), 1), "center_y": round(float(y1 + h / 2), 1),
                         "area": round(float(w * h), 1),
+                        "team": TEAM_SHORT[last_teams[k]] if last_teams[k] >= 0 else "",
                     })
             if sink and (run_model or args.reuse_detections):
-                sink.write(annotate(frame, last, names, not args.hide_conf))
+                if tracker:
+                    img = annotate(frame, last, names, not args.hide_conf, last_teams,
+                                   teams_clf.colors, tracker.holder)
+                    draw_possession_panel(img, tracker, teams_clf.colors)
+                else:
+                    img = annotate(frame, last, names, not args.hide_conf)
+                sink.write(img)
             if run_model and frames_done % 10 == 0:
                 el = time.time() - t0
                 n_left = (end - idx - 1) / args.frame_skip
@@ -434,6 +697,8 @@ def run(args: argparse.Namespace, detector=None) -> dict:
     cap.release()
     if sink:
         sink.close()
+    if poss_fh:
+        poss_fh.close()
 
     elapsed = time.time() - t0
     print(f"\n[ok] {frames_done} quadros analisados em {elapsed:.1f}s "
@@ -445,8 +710,15 @@ def run(args: argparse.Namespace, detector=None) -> dict:
     for name in names:
         if counts[name] or name in DEFAULT_CLASS_NAMES:
             print(f"  {LABELS_PT.get(name, name):10s} {counts[name]:6d}  ({counts[name] / max(frames_done, 1):.1f}/quadro)")
+    possession = None
+    if tracker:
+        pct = tracker.percentages()
+        print(f"\nPosse de bola (CSV: {poss_path}):")
+        for t in (0, 1):
+            print(f"  {TEAM_NAMES[t]}  {fmt_time(tracker.seconds[t])}  {pct[t]:5.1f}%")
+        possession = {"seconds": list(tracker.seconds), "pct": pct, "csv": str(poss_path)}
     return {"frames": frames_done, "counts": dict(counts), "csv": str(csv_path),
-            "video": str(video_path) if sink else None}
+            "video": str(video_path) if sink else None, "possession": possession}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -476,6 +748,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-video", action="store_true", help="não gera o vídeo anotado, só o CSV")
     p.add_argument("--hide-conf", action="store_true", help="não mostra a confiança nos rótulos")
     p.add_argument("--optimize", action="store_true", help="usa optimize_for_inference() (mais rápido em GPU)")
+    p.add_argument("--no-possession", action="store_true", help="desativa equipes e posse de bola")
+    p.add_argument("--possession-distance", type=float, default=100,
+                   help="distância máx. bola-jogador para posse, em px de um quadro 1080p (escala com a resolução; padrão 100)")
+    p.add_argument("--possession-min-seconds", type=float, default=3.0,
+                   help="segundos seguidos com a outra equipe para a posse trocar (padrão 3)")
+    p.add_argument("--team-calib-frames", type=int, default=10,
+                   help="quadros amostrados para aprender as cores das equipes (padrão 10)")
     return p
 
 

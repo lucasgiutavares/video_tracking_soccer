@@ -1,0 +1,77 @@
+ssh root@62.238.86.60 -i id_ed
+
+ssh root@62.238.86.60 -i "C:\Arctron\CBF\Video Tracking\id_ed"
+
+rSb7PC_sutLmDx
+source venv/bin/activate
+scp -i id_ed /cbf/'Video Tracking'/teste_corte10.mp4 root@62.238.86.60:/root/cbf/
+scp -i id_ed /cbf/'Video Tracking'/teste_corte23.mp4 root@62.238.86.60:/root/cbf/
+scp -i id_ed /cbf/'Video Tracking'/rastreio_futebol_v2.py root@62.238.86.60:/root/cbf/
+scp -i id_ed /cbf/'Video Tracking'/rastreio_futebol_v3.py root@62.238.86.60:/root/cbf/
+scp -i id_ed /cbf/'Video Tracking'/linha_impedimento.py root@62.238.86.60:/root/cbf/
+scp -i id_ed /cbf/'Video Tracking'/posse.py root@62.238.86.60:/root/cbf/
+scp -i id_ed /cbf/'Video Tracking'/bola.py root@62.238.86.60:/root/cbf/
+scp -i id_ed /cbf/'Video Tracking'/numeros.py root@62.238.86.60:/root/cbf/
+scp -i id_ed root@62.238.86.60:/root/cbf/anotado.mp4 /cbf/'Video Tracking'
+python rastreio_futebol_v2.py --video teste_corte10.mp4 --saida-csv posicoes.csv --saida-video anotado.mp4
+python rastreio_futebol_v3.py --video teste_corte10.mp4 --saida-csv posicoes.csv --saida-video anotado.mp4
+python rastreio_futebol_v3.py --video teste_corte10.mp4 --saida-csv posicoes.csv --nomes "0,1,2,3" --posse --saida-posse posse.csv --saida-video anotado.mp4
+python rastreio_futebol_v3.py --video teste_corte23.mp4 --saida-csv posicoes.csv --nomes "0,1,2,3" --posse --saida-posse posse.csv --saida-video anotado.mp4
+python rastreio_futebol_v3.py --video teste_corte23.mp4 --saida-csv posicoes.csv --nomes "0,1,2,3" --conf 0.10 --bola-candidatos 5 --posse --saida-posse posse.csv --saida-video anotado.mp4
+
+python linha_impedimento.py --video teste_corte10.mp4 --homografia campo.json --nomes "mandante,visitante,arbitragem,goleiros" --defende visitante,goleiros --ataca mandante --gol-defendido direita --saida-video impedimento.mp4 --saida-csv impedimento.csv
+
+python calibrar_rede.py --video teste_corte10.mp4 --modulo meu_detector.py --saida homografias.npz --preencher-propagando --video-conferencia conf_calib.mp4
+
+python linha_impedimento.py --video jogo.mp4 \
+    --homografia-video homografias.npz \
+    --nomes "mandante,visitante,arbitragem,goleiros" \
+    --defende visitante,goleiros --ataca mandante \
+    --gol-defendido direita \
+    --saida-video impedimento.mp4 --saida-csv impedimento.csv
+
+NEW
+rSb7PC_sutLmDx
+python analise_lance.py --video teste_corte23.mp4 --detector cor --time-passes vermelho --ataca direita --saida-video lance_vermelho.mp4 --saida-csv lance_vermelho.csv
+python analise_lance.py --video teste_corte23.mp4 --detector yolo --modelo yolov8x.pt --imgsz-pessoa 1280 --imgsz-bola 1280 --conf-pessoa 0.25 --conf-bola 0.06 --mosaico 3x2 --nomes "chile,brasil,arbitragem,goleiros" --time-passes chile --ataca direita --saida-video lance.mp4
+
+scp -i id_ed /cbf/'Video Tracking'/new/analise_lance.py root@62.238.86.60:/root/cbf/new/
+scp -i id_ed /cbf/'Video Tracking'/new/bola.py root@62.238.86.60:/root/cbf/new/
+scp -i id_ed /cbf/'Video Tracking'/new/detector_cor.py root@62.238.86.60:/root/cbf/new/
+scp -i id_ed /cbf/'Video Tracking'/new/detector_yolo.py root@62.238.86.60:/root/cbf/new/
+scp -i id_ed /cbf/'Video Tracking'/new/diagnostico_deteccao.py root@62.238.86.60:/root/cbf/new/
+scp -i id_ed /cbf/'Video Tracking'/new/gramado.py root@62.238.86.60:/root/cbf/new/
+scp -i id_ed /cbf/'Video Tracking'/new/homografia.py root@62.238.86.60:/root/cbf/new/
+scp -i id_ed /cbf/'Video Tracking'/new/passes.py root@62.238.86.60:/root/cbf/new/
+scp -i id_ed /cbf/'Video Tracking'/new/posse.py root@62.238.86.60:/root/cbf/new/
+scp -i id_ed /cbf/'Video Tracking'/new/times.py root@62.238.86.60:/root/cbf/new/
+scp -i id_ed /cbf/'Video Tracking'/new/teste_corte23.mp4 root@62.238.86.60:/root/cbf/new/
+scp -i id_ed /cbf/'Video Tracking'/new/teste_corte736.mp4 root@62.238.86.60:/root/cbf/new/
+scp -i id_ed /cbf/'Video Tracking'/new/brasil_chile_pt.mp4 root@62.238.86.60:/root/cbf/new/
+
+python -c "import analise_lance, detector_yolo, bola, posse, passes, times; print('ok')"
+
+python analise_lance.py --video teste_corte23.mp4 --detector yolo --modelo yolov8x.pt --imgsz-pessoa 1600 --imgsz-bola 1536 --mosaico 3x2 --conf-pessoa 0.20 --conf-bola 0.05 --bola-candidatos 8 --tracker botsort.yaml --grupos 4 --nomes "chile,brasil,arbitragem,goleiros" --frames-calibracao 80 --time-passes chile --ataca direita --ignorar arbitragem,goleiros --sem-dica-bola --desenhar-limites --largura-saida 1920 --device 0 --saida-video lance_final.mp4 --saida-csv lance_final.csv
+python analise_lance.py --video teste_corte23.mp4 --detector yolo --modelo yolov8x.pt --imgsz-pessoa 1600 --imgsz-bola 1536 --mosaico 3x2 --conf-pessoa 0.20 --conf-bola 0.05 --bola-candidatos 8 --tracker botsort.yaml --grupos 4 --cores "chile=#D52B1E,brasil=#FFDF00,arbitragem=#1A1A1A" --frames-calibracao 80 --time-passes chile --ataca direita --ignorar arbitragem --sem-dica-bola --desenhar-limites --largura-saida 1920 --device 0 --saida-video lance_final.mp4 --saida-csv lance_final.csv
+python analise_lance.py --video teste_corte736.mp4 --detector yolo --modelo yolov8x.pt --imgsz-pessoa 1600 --imgsz-bola 1536 --mosaico 3x2 --conf-pessoa 0.20 --conf-bola 0.05 --bola-candidatos 8 --tracker botsort.yaml --grupos 4 --cores "chile=#D52B1E,brasil=#FFDF00,arbitragem=#1A1A1A" --frames-calibracao 80 --time-passes chile --ataca direita --ignorar arbitragem --sem-dica-bola --desenhar-limites --largura-saida 1920 --device 0 --saida-video lance_final.mp4 --saida-csv lance_final.csv
+python analise_lance.py --video brasil_chile_pt.mp4 --detector yolo --modelo yolov8x.pt --imgsz-pessoa 1600 --imgsz-bola 1536 --mosaico 3x2 --conf-pessoa 0.20 --conf-bola 0.05 --bola-candidatos 8 --tracker botsort.yaml --grupos 4 --cores "chile=#D52B1E,brasil=#FFDF00,arbitragem=#1A1A1A" --frames-calibracao 80 --time-passes chile --ataca direita --ignorar arbitragem --sem-dica-bola --desenhar-limites --largura-saida 1920 --device 0 --saida-video lance_final.mp4 --saida-csv lance_final.csv
+
+scp -i id_ed root@62.238.86.60:/root/cbf/new/lance_final.mp4 /cbf/'Video Tracking'/new
+
+tentando baixar direto do servidor com:
+
+~/yt-dlp --js-runtimes deno --remote-components ejs:npm --cookies cookies.txt -f "bv*+ba/b" --merge-output-format mp4 -o "%(title)s.%(ext)s" "https://www.youtube.com/watch?v=2IL4l3Mbe84"
+
+
+ffmpeg -i brasil_chile.mp4 -ss 00:03:45 -to 00:03:55 -c copy brasil_chile_pt.mp4
+ffmpeg -i brasil_chile.mp4 -ss 00:03:45 -to 00:56:09 -c copy brasil_chile_pt.mp4
+ffmpeg -i brasil_chile.mp4 -ss 00:03:45 -to 00:03:55 -c copy teste_corte10.mp4
+
+ffprobe -hide_banner brasil_chile.webm
+ffmpeg -c:v libdav1d -i brasil_chile.webm -c:v libx264 -preset veryfast -crf 18 -an brasil_chile.mp4
+
+ffmpeg -i brasil_chile.webm -c copy brasil_chile.mp4
+
+______ RF-DETR
+
+python detect_soccer.py original/teste_corte23.mp4 --single-ball --tiles 2 --class-threshold ball=0.3 --class-threshold player=0.6

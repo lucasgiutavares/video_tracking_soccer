@@ -34,7 +34,34 @@ Saídas em `./saida/` (mude com `-o`):
 | arquivo | conteúdo |
 |---|---|
 | `<nome>_annotated.mp4` | vídeo com caixas (bola marcada com triângulo), 1920 px de largura por padrão |
-| `<nome>_detections.csv` | `frame, timestamp, class_id, class_name, confidence, x1, y1, x2, y2, width, height, center_x, center_y, area` (coordenadas no quadro original) |
+| `<nome>_detections.csv` | `frame, timestamp, class_id, class_name, confidence, x1, y1, x2, y2, width, height, center_x, center_y, area, team` (coordenadas no quadro original; `team` = A/B para jogadores e goleiros) |
+| `<nome>_possession.csv` | por quadro analisado: `frame, timestamp, ball_detected, team_near_ball, possession_team, seconds_A, seconds_B, pct_A, pct_B` |
+
+## Posse de bola
+
+Segue a ideia do `analyze_ball_possession(df, distance_threshold=100)` do model card:
+o jogador mais próximo da bola, até `--possession-distance` px, tem a posse.
+
+1. **Equipes:** o modelo não distingue equipes. Antes do processamento, o script amostra
+   `--team-calib-frames` quadros, extrai a cor do tronco de cada jogador (descartando grama) e
+   separa as cores em 2 grupos (k-means). Equipe A = camisa mais clara. Goleiros vão para a equipe
+   cujos jogadores estão mais perto deles no eixo horizontal. Árbitros ficam de fora.
+2. **Posse:** a posse fica com a última equipe que teve a bola e só troca quando o modelo vê a
+   outra equipe com ela por pelo menos `--possession-min-seconds` segundos seguidos (padrão 3).
+   Enquanto a bola não é identificada (ou está longe de todos), a posse continua com a última
+   equipe e a contagem da troca fica pausada. A contagem só zera quando a equipe com a posse
+   volta a ser vista com a bola. O tempo antes da primeira posse não é contado.
+3. **Vídeo:** caixas na cor de cada equipe, elipse vermelha no jogador com a bola e um painel no
+   canto inferior esquerdo com o tempo (mm:ss), a % de cada equipe e uma barra proporcional.
+
+| opção | efeito |
+|---|---|
+| `--possession-distance 100` | distância máx. bola–caixa do jogador, em px de um quadro 1080p (escala com a resolução) |
+| `--possession-min-seconds 3` | segundos seguidos com a outra equipe para a posse trocar |
+| `--team-calib-frames 10` | quadros extras analisados para aprender as cores |
+| `--no-possession` | desativa equipes e posse |
+
+Dica: use `--single-ball` e, em 4K, `--tiles 2` com `--class-threshold ball=0.3`, porque a posse depende de achar a bola.
 
 ## Opções principais
 
