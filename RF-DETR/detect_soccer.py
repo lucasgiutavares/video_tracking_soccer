@@ -16,11 +16,13 @@ Exemplos:
   python detect_soccer.py teste_corte23.mp4 --frame-skip 5 --max-frames 300
   python detect_soccer.py jogo.mp4 --weights ./checkpoint.pth --device cuda \
       --class-threshold player=0.7 --class-threshold ball=0.4
+  ROBOFLOW_API_KEY=... python detect_soccer.py teste_corte23.mp4 --pitch   # homografia do campo
 """
 from __future__ import annotations
 
 import argparse
 import csv
+import os
 import shutil
 import subprocess
 import sys
@@ -499,6 +501,231 @@ def calibrate_teams(cap, detect, start: int, end: int, n_frames: int, names: lis
 
 
 # --------------------------------------------------------------------------- #
+# Campo e homografia
+# --------------------------------------------------------------------------- #
+# Modelo de pontos-chave do campo do Roboflow (32 pontos, mesmo esquema do
+# repositório roboflow/sports): https://universe.roboflow.com/roboflow-jvuqo/football-field-detection-f07vi
+ROBOFLOW_PITCH_MODEL = "football-field-detection-f07vi/14"
+
+# Campo padrão em metros (o mesmo do roboflow/sports). Campos reais variam de
+# tamanho; as coordenadas saem nesse campo de referência de 120 x 70 m.
+PITCH_LENGTH, PITCH_WIDTH = 120.0, 70.0
+PENALTY_BOX_W, PENALTY_BOX_L = 41.0, 20.15
+GOAL_BOX_W, GOAL_BOX_L = 18.32, 5.5
+CENTRE_CIRCLE_R, PENALTY_SPOT = 9.15, 11.0
+
+
+def pitch_vertices() -> np.ndarray:
+    """Os 32 pontos de referência do campo, na ordem dos pontos-chave do modelo (x = comprimento)."""
+    L, W = PITCH_LENGTH, PITCH_WIDTH
+    pb1, pb2 = (W - PENALTY_BOX_W) / 2, (W + PENALTY_BOX_W) / 2
+    gb1, gb2 = (W - GOAL_BOX_W) / 2, (W + GOAL_BOX_W) / 2
+    return np.array([
+        (0, 0), (0, pb1), (0, gb1), (0, gb2), (0, pb2), (0, W),                      # 1-6
+        (GOAL_BOX_L, gb1), (GOAL_BOX_L, gb2),                                        # 7-8
+        (PENALTY_SPOT, W / 2),                                                       # 9
+        (PENALTY_BOX_L, pb1), (PENALTY_BOX_L, gb1), (PENALTY_BOX_L, gb2), (PENALTY_BOX_L, pb2),  # 10-13
+        (L / 2, 0), (L / 2, W / 2 - CENTRE_CIRCLE_R), (L / 2, W / 2 + CENTRE_CIRCLE_R), (L / 2, W),  # 14-17
+        (L - PENALTY_BOX_L, pb1), (L - PENALTY_BOX_L, gb1), (L - PENALTY_BOX_L, gb2), (L - PENALTY_BOX_L, pb2),  # 18-21
+        (L - PENALTY_SPOT, W / 2),                                                   # 22
+        (L - GOAL_BOX_L, gb1), (L - GOAL_BOX_L, gb2),                                # 23-24
+        (L, 0), (L, pb1), (L, gb1), (L, gb2), (L, pb2), (L, W),                      # 25-30
+        (L / 2 - CENTRE_CIRCLE_R, W / 2), (L / 2 + CENTRE_CIRCLE_R, W / 2),          # 31-32
+    ], np.float32)
+
+
+PITCH_VERTICES = pitch_vertices()
+N_PITCH_KEYPOINTS = len(PITCH_VERTICES)
+# Linhas do campo para o minimapa (índices 1-based dos pontos acima)
+PITCH_EDGES = [(1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (7, 8), (10, 11), (11, 12), (12, 13),
+               (14, 15), (15, 16), (16, 17), (18, 19), (19, 20), (20, 21), (23, 24), (25, 26),
+               (26, 27), (27, 28), (28, 29), (29, 30), (1, 14), (2, 10), (3, 7), (4, 8),
+               (5, 13), (6, 17), (14, 25), (18, 26), (23, 27), (24, 28), (21, 29), (17, 30)]
+
+
+class PitchKeypointModel:
+    """Detecta os 32 pontos-chave do campo com o modelo do Roboflow.
+
+    Usa o pacote `inference` do Roboflow (precisa de chave de API; os pesos são
+    baixados e a inferência roda localmente) ou, com `weights`, um .pt local do
+    mesmo modelo carregado pelo `ultralytics`.
+    """
+
+    def __init__(self, weights: str | None, api_key: str | None, model_id: str, device: str | None):
+        self.device = device
+        if weights:
+            try:
+                from ultralytics import YOLO
+            except ImportError:
+                sys.exit("--pitch-weights requer o pacote 'ultralytics': pip install ultralytics")
+            print(f"[campo] carregando {weights} (ultralytics)")
+            self.model, self.backend = YOLO(weights), "ultralytics"
+            return
+        key = api_key or os.environ.get("ROBOFLOW_API_KEY")
+        if not key:
+            sys.exit("--pitch requer uma chave do Roboflow (variável ROBOFLOW_API_KEY ou "
+                     "--roboflow-api-key) ou pesos locais com --pitch-weights")
+        try:
+            from inference import get_model
+        except ImportError:
+            sys.exit("--pitch requer o pacote 'inference' do Roboflow: pip install inference "
+                     "(ou inference-gpu)")
+        print(f"[campo] carregando {model_id} (Roboflow)")
+        self.model, self.backend = get_model(model_id=model_id, api_key=key), "roboflow"
+
+    def __call__(self, frame_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Devolve (32, 2) posições em px e (32,) confianças; confiança 0 = ponto não encontrado."""
+        xy = np.zeros((N_PITCH_KEYPOINTS, 2), np.float32)
+        conf = np.zeros(N_PITCH_KEYPOINTS, np.float32)
+        if self.backend == "ultralytics":
+            kw = {"device": self.device} if self.device else {}
+            r = self.model(frame_bgr, verbose=False, **kw)[0]
+            if r.keypoints is None or len(r.keypoints) == 0:
+                return xy, conf
+            k = int(np.argmax(r.boxes.conf.cpu().numpy())) if r.boxes is not None and len(r.boxes) else 0
+            pts = r.keypoints.xy[k].cpu().numpy()
+            c = r.keypoints.conf[k].cpu().numpy() if r.keypoints.conf is not None else np.ones(len(pts))
+            n = min(N_PITCH_KEYPOINTS, len(pts))
+            xy[:n], conf[:n] = pts[:n], c[:n]
+            return xy, conf
+        res = self.model.infer(frame_bgr, confidence=0.3)
+        res = res[0] if isinstance(res, list) else res
+        preds = getattr(res, "predictions", None) or []
+        if not preds:
+            return xy, conf
+        best = max(preds, key=lambda p: p.confidence)
+        for i, kp in enumerate(best.keypoints):
+            j = getattr(kp, "class_id", None)
+            j = i if j is None else int(j)
+            if 0 <= j < N_PITCH_KEYPOINTS:
+                xy[j], conf[j] = (kp.x, kp.y), kp.confidence
+        return xy, conf
+
+
+class PitchMapper:
+    """Homografia quadro -> campo (metros), recalculada a cada quadro analisado.
+
+    Precisa de pelo menos 4 pontos-chave confiáveis que não estejam alinhados.
+    Se um quadro não tiver pontos suficientes, mantém a última homografia por até
+    `max_age` segundos (a câmera se move, então uma homografia velha fica errada).
+    """
+
+    def __init__(self, model: PitchKeypointModel, kp_conf: float, max_age: float):
+        self.model = model
+        self.kp_conf = kp_conf
+        self.max_age = max_age
+        self.H: np.ndarray | None = None
+        self.age = float("inf")
+        self.fresh = False  # homografia calculada neste quadro (não herdada)
+        self.kp_xy = np.zeros((N_PITCH_KEYPOINTS, 2), np.float32)
+        self.kp_mask = np.zeros(N_PITCH_KEYPOINTS, bool)
+
+    @property
+    def valid(self) -> bool:
+        return self.H is not None
+
+    @property
+    def n_points(self) -> int:
+        return int(self.kp_mask.sum())
+
+    def update(self, frame: np.ndarray, dt: float) -> None:
+        xy, conf = self.model(frame)
+        self.kp_xy, self.kp_mask = xy, conf >= self.kp_conf
+        H = self._fit(xy[self.kp_mask], PITCH_VERTICES[self.kp_mask])
+        self.fresh = H is not None
+        if H is not None:
+            self.H, self.age = H, 0.0
+        else:
+            self.age += dt
+            if self.age > self.max_age:
+                self.H = None
+
+    @staticmethod
+    def _fit(src: np.ndarray, dst: np.ndarray) -> np.ndarray | None:
+        if len(src) < 4:
+            return None
+        # pontos quase alinhados (ex.: só a linha do meio) dão homografia degenerada
+        if cv2.contourArea(cv2.convexHull(dst.reshape(-1, 1, 2))) < 20.0:
+            return None
+        method = cv2.RANSAC if len(src) >= 6 else 0
+        H, _ = cv2.findHomography(src.reshape(-1, 1, 2), dst.reshape(-1, 1, 2), method, 2.0)
+        if H is None or not np.isfinite(H).all() or abs(np.linalg.det(H)) < 1e-12:
+            return None
+        return H
+
+    def to_pitch(self, pts: np.ndarray) -> np.ndarray | None:
+        """Converte pontos (N, 2) em px para metros no campo; None sem homografia."""
+        if self.H is None:
+            return None
+        if len(pts) == 0:
+            return np.zeros((0, 2), np.float32)
+        return cv2.perspectiveTransform(pts.reshape(-1, 1, 2).astype(np.float32), self.H).reshape(-1, 2)
+
+
+def anchor_points(det: Detections, names: list[str]) -> np.ndarray:
+    """Ponto de cada detecção que toca o gramado: pés (base da caixa) para pessoas, centro para a bola.
+
+    A bola no alto é projetada no ponto do gramado atrás dela, não sob ela.
+    """
+    x1, y1, x2, y2 = det.xyxy.T
+    is_ball = np.array([class_name(names, int(c)) == "ball" for c in det.class_id], bool)
+    return np.stack([(x1 + x2) / 2, np.where(is_ball, (y1 + y2) / 2, y2)], axis=1).astype(np.float32)
+
+
+def draw_pitch_keypoints(img: np.ndarray, mapper: PitchMapper) -> None:
+    """Marca os pontos-chave do campo usados na homografia (para conferir o modelo)."""
+    r = max(3, img.shape[0] // 270)
+    for i in np.flatnonzero(mapper.kp_mask):
+        x, y = map(int, mapper.kp_xy[i])
+        cv2.circle(img, (x, y), r, (255, 0, 255), -1, cv2.LINE_AA)
+        cv2.putText(img, str(i + 1), (x + r + 2, y - r), cv2.FONT_HERSHEY_SIMPLEX,
+                    max(0.4, img.shape[0] / 2700), (255, 0, 255), 1, cv2.LINE_AA)
+
+
+def draw_radar(img: np.ndarray, mapper: PitchMapper, det: Detections, names: list[str],
+               teams: np.ndarray, team_colors: list | None, holder: int | None) -> None:
+    """Minimapa do campo no canto inferior direito com jogadores, árbitros e bola."""
+    H, W = img.shape[:2]
+    s = H / 1080
+    pad = 3.0  # metros de margem fora das linhas
+    m, rw = int(20 * s), int(460 * s)
+    scale = rw / (PITCH_LENGTH + 2 * pad)
+    rh = int((PITCH_WIDTH + 2 * pad) * scale)
+    x0, y0 = W - m - rw, H - m - rh
+    roi = img[y0:y0 + rh, x0:x0 + rw]
+    roi[:] = cv2.addWeighted(roi, 0.3, np.full_like(roi, (40, 110, 40)), 0.7, 0)
+
+    def px(p) -> tuple[int, int]:
+        return int(x0 + (p[0] + pad) * scale), int(y0 + (p[1] + pad) * scale)
+
+    line = (235, 235, 235)
+    for a, b in PITCH_EDGES:
+        cv2.line(img, px(PITCH_VERTICES[a - 1]), px(PITCH_VERTICES[b - 1]), line, 1, cv2.LINE_AA)
+    cv2.circle(img, px((PITCH_LENGTH / 2, PITCH_WIDTH / 2)), int(CENTRE_CIRCLE_R * scale), line, 1, cv2.LINE_AA)
+    if not mapper.valid:
+        cv2.putText(img, "sem homografia", (x0 + int(10 * s), y0 + int(24 * s)), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6 * s, (255, 255, 255), max(1, int(1.5 * s)), cv2.LINE_AA)
+        return
+    pts = mapper.to_pitch(anchor_points(det, names))
+    r = max(3, int(6 * s))
+    order = sorted(range(len(det)), key=lambda i: class_name(names, int(det.class_id[i])) == "ball")
+    for i in order:  # bola por último, por cima dos jogadores
+        x, y = pts[i]
+        if not (-pad <= x <= PITCH_LENGTH + pad and -pad <= y <= PITCH_WIDTH + pad):
+            continue
+        name = class_name(names, int(det.class_id[i]))
+        team = int(teams[i]) if i < len(teams) else -1
+        color = team_colors[team] if team >= 0 and team_colors else CLASS_COLORS.get(name, FALLBACK_COLOR)
+        c = px((x, y))
+        if name == "ball":
+            cv2.circle(img, c, max(2, r - 2), CLASS_COLORS["ball"], -1, cv2.LINE_AA)
+            cv2.circle(img, c, max(2, r - 2), (0, 0, 0), 1, cv2.LINE_AA)
+            continue
+        cv2.circle(img, c, r, color, -1, cv2.LINE_AA)
+        cv2.circle(img, c, r, (0, 0, 255) if i == holder else (0, 0, 0), 2 if i == holder else 1, cv2.LINE_AA)
+
+
+# --------------------------------------------------------------------------- #
 # Escrita do vídeo
 # --------------------------------------------------------------------------- #
 class VideoSink:
@@ -538,9 +765,12 @@ class VideoSink:
 # Pipeline
 # --------------------------------------------------------------------------- #
 CSV_FIELDS = ["frame", "timestamp", "class_id", "class_name", "confidence",
-              "x1", "y1", "x2", "y2", "width", "height", "center_x", "center_y", "area", "team"]
+              "x1", "y1", "x2", "y2", "width", "height", "center_x", "center_y", "area", "team",
+              "pitch_x", "pitch_y"]
 POSSESSION_FIELDS = ["frame", "timestamp", "ball_detected", "team_near_ball", "possession_team",
                      "seconds_A", "seconds_B", "pct_A", "pct_B"]
+PITCH_FIELDS = ["frame", "timestamp", "keypoints", "homography", "fresh",
+                *[f"h{r}{c}" for r in (1, 2, 3) for c in (1, 2, 3)]]
 
 
 def parse_class_thresholds(items: list[str]) -> dict[str, float]:
@@ -619,6 +849,12 @@ def run(args: argparse.Namespace, detector=None) -> dict:
             print("[posse] jogadores insuficientes para separar as equipes; posse desativada")
             teams_clf = None
 
+    mapper, pitch_path = None, None
+    if args.pitch:
+        kp_model = PitchKeypointModel(args.pitch_weights, args.roboflow_api_key, args.pitch_model, args.device)
+        mapper = PitchMapper(kp_model, args.pitch_kp_conf, args.pitch_max_age)
+        pitch_path = out_dir / f"{stem}_pitch.csv"
+
     sink = None
     if not args.no_video:
         out_w = min(args.output_width or W, W)
@@ -638,6 +874,11 @@ def run(args: argparse.Namespace, detector=None) -> dict:
     poss_writer = csv.DictWriter(poss_fh, fieldnames=POSSESSION_FIELDS) if poss_fh else None
     if poss_writer:
         poss_writer.writeheader()
+    pitch_fh = open(pitch_path, "w", newline="") if pitch_path else None
+    pitch_writer = csv.DictWriter(pitch_fh, fieldnames=PITCH_FIELDS) if pitch_fh else None
+    if pitch_writer:
+        pitch_writer.writeheader()
+    pitch_frames_ok = 0
 
     with open(csv_path, "w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=CSV_FIELDS)
@@ -655,6 +896,17 @@ def run(args: argparse.Namespace, detector=None) -> dict:
                 last_teams = teams_clf.predict(frame, det, names) if teams_clf else np.full(len(det), -1)
                 frames_done += 1
                 ts = idx / fps
+                pitch_pts = None
+                if mapper:
+                    mapper.update(frame, dt)
+                    pitch_pts = mapper.to_pitch(anchor_points(det, names))
+                    pitch_frames_ok += mapper.valid
+                    Hm = [float(v) for v in mapper.H.ravel()] if mapper.valid else [""] * 9
+                    pitch_writer.writerow({
+                        "frame": idx, "timestamp": round(ts, 3), "keypoints": mapper.n_points,
+                        "homography": int(mapper.valid), "fresh": int(mapper.fresh),
+                        **dict(zip(PITCH_FIELDS[5:], Hm)),
+                    })
                 if tracker:
                     near = tracker.update(det, last_teams, names, dt)
                     pct = tracker.percentages()
@@ -679,6 +931,8 @@ def run(args: argparse.Namespace, detector=None) -> dict:
                         "center_x": round(float(x1 + w / 2), 1), "center_y": round(float(y1 + h / 2), 1),
                         "area": round(float(w * h), 1),
                         "team": TEAM_SHORT[last_teams[k]] if last_teams[k] >= 0 else "",
+                        "pitch_x": round(float(pitch_pts[k, 0]), 2) if pitch_pts is not None else "",
+                        "pitch_y": round(float(pitch_pts[k, 1]), 2) if pitch_pts is not None else "",
                     })
             if sink and (run_model or args.reuse_detections):
                 if tracker:
@@ -687,6 +941,13 @@ def run(args: argparse.Namespace, detector=None) -> dict:
                     draw_possession_panel(img, tracker, teams_clf.colors)
                 else:
                     img = annotate(frame, last, names, not args.hide_conf)
+                if mapper:
+                    if args.pitch_show_keypoints:
+                        draw_pitch_keypoints(img, mapper)
+                    if not args.no_radar:
+                        draw_radar(img, mapper, last, names, last_teams,
+                                   teams_clf.colors if teams_clf else None,
+                                   tracker.holder if tracker else None)
                 sink.write(img)
             if run_model and frames_done % 10 == 0:
                 el = time.time() - t0
@@ -699,6 +960,8 @@ def run(args: argparse.Namespace, detector=None) -> dict:
         sink.close()
     if poss_fh:
         poss_fh.close()
+    if pitch_fh:
+        pitch_fh.close()
 
     elapsed = time.time() - t0
     print(f"\n[ok] {frames_done} quadros analisados em {elapsed:.1f}s "
@@ -717,8 +980,14 @@ def run(args: argparse.Namespace, detector=None) -> dict:
         for t in (0, 1):
             print(f"  {TEAM_NAMES[t]}  {fmt_time(tracker.seconds[t])}  {pct[t]:5.1f}%")
         possession = {"seconds": list(tracker.seconds), "pct": pct, "csv": str(poss_path)}
+    pitch = None
+    if mapper:
+        ratio = pitch_frames_ok / max(frames_done, 1)
+        print(f"\nHomografia do campo (CSV: {pitch_path}): {pitch_frames_ok}/{frames_done} "
+              f"quadros ({100 * ratio:.0f}%)")
+        pitch = {"frames_ok": pitch_frames_ok, "ratio": ratio, "csv": str(pitch_path)}
     return {"frames": frames_done, "counts": dict(counts), "csv": str(csv_path),
-            "video": str(video_path) if sink else None, "possession": possession}
+            "video": str(video_path) if sink else None, "possession": possession, "pitch": pitch}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -755,6 +1024,19 @@ def build_parser() -> argparse.ArgumentParser:
                    help="segundos seguidos com a outra equipe para a posse trocar (padrão 3)")
     p.add_argument("--team-calib-frames", type=int, default=10,
                    help="quadros amostrados para aprender as cores das equipes (padrão 10)")
+    p.add_argument("--pitch", action="store_true",
+                   help="detecta os pontos do campo (modelo do Roboflow) e calcula a homografia para metros")
+    p.add_argument("--roboflow-api-key", help="chave do Roboflow (padrão: variável ROBOFLOW_API_KEY)")
+    p.add_argument("--pitch-model", default=ROBOFLOW_PITCH_MODEL,
+                   help=f"ID do modelo de campo no Roboflow (padrão {ROBOFLOW_PITCH_MODEL})")
+    p.add_argument("--pitch-weights", help="pesos .pt locais do modelo de campo (usa ultralytics, sem chave)")
+    p.add_argument("--pitch-kp-conf", type=float, default=0.5,
+                   help="confiança mínima de cada ponto do campo (padrão 0.5)")
+    p.add_argument("--pitch-max-age", type=float, default=0.5,
+                   help="segundos que a última homografia vale quando faltam pontos (padrão 0.5)")
+    p.add_argument("--pitch-show-keypoints", action="store_true",
+                   help="desenha no vídeo os pontos do campo detectados")
+    p.add_argument("--no-radar", action="store_true", help="não desenha o minimapa do campo")
     return p
 
 

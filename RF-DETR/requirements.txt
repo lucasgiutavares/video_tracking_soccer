@@ -5,3 +5,6 @@ rfdetr>=1.3
 huggingface_hub
 opencv-python
 numpy
+# Opcional, para --pitch (homografia do campo):
+#   inference (ou inference-gpu)  -> modelo do Roboflow com ROBOFLOW_API_KEY
+#   ultralytics                   -> pesos .pt locais com --pitch-weights

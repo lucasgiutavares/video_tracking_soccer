@@ -6,6 +6,7 @@ rSb7PC_sutLmDx
 source venv/bin/activate
 scp -i id_ed /cbf/'Video Tracking'/teste_corte10.mp4 root@62.238.86.60:/root/cbf/
 scp -i id_ed /cbf/'Video Tracking'/teste_corte23.mp4 root@62.238.86.60:/root/cbf/
+scp -i id_ed /cbf/'Video Tracking'/teste_corte736.mp4 root@62.238.86.60:/root/cbf/
 scp -i id_ed /cbf/'Video Tracking'/rastreio_futebol_v2.py root@62.238.86.60:/root/cbf/
 scp -i id_ed /cbf/'Video Tracking'/rastreio_futebol_v3.py root@62.238.86.60:/root/cbf/
 scp -i id_ed /cbf/'Video Tracking'/linha_impedimento.py root@62.238.86.60:/root/cbf/
@@ -74,4 +75,9 @@ ffmpeg -i brasil_chile.webm -c copy brasil_chile.mp4
 
 ______ RF-DETR
 
-python detect_soccer.py original/teste_corte23.mp4 --single-ball --tiles 2 --class-threshold ball=0.3 --class-threshold player=0.6
+python detect_soccer.py /cbf/'Video Tracking'/original/teste_corte23.mp4 --single-ball --tiles 2 --class-threshold ball=0.3 --class-threshold player=0.6
+python detect_soccer.py /cbf/'Video Tracking'/teste_corte736.mp4 --single-ball --tiles 2 --class-threshold ball=0.3 --class-threshold player=0.6
+python3 detect_soccer.py original/teste_corte736.mp4 --single-ball --tiles 2 --class-threshold ball=0.3 --class-threshold player=0.6
+
+mv /cbf/'Video Tracking'/teste_corte736.mp4 /video_tracking_soccer/RF-DETR/original/teste_corte736.mp4
+mv teste_corte736.mp4 /video_tracking_soccer/RF-DETR/original/teste_corte736.mp4

@@ -63,6 +63,47 @@ o jogador mais próximo da bola, até `--possession-distance` px, tem a posse.
 
 Dica: use `--single-ball` e, em 4K, `--tiles 2` com `--class-threshold ball=0.3`, porque a posse depende de achar a bola.
 
+## Campo e homografia (`--pitch`)
+
+Usa o modelo de pontos-chave do campo do Roboflow
+([football-field-detection](https://universe.roboflow.com/roboflow-jvuqo/football-field-detection-f07vi),
+o mesmo do repositório [roboflow/sports](https://github.com/roboflow/sports)). Ele encontra até 32
+pontos de referência (cantos, áreas, meio-campo, círculo central). Com pelo menos 4 pontos
+confiáveis e não alinhados, o script calcula a homografia que leva cada pixel para metros num
+campo padrão de 120 × 70 m. A homografia é recalculada a cada quadro analisado, porque a câmera se move.
+
+```bash
+pip install inference            # ou inference-gpu
+export ROBOFLOW_API_KEY=sua_chave
+python detect_soccer.py teste_corte23.mp4 --pitch --pitch-show-keypoints
+
+# alternativa sem chave: pesos .pt locais do mesmo modelo (roboflow/sports)
+pip install ultralytics
+python detect_soccer.py teste_corte23.mp4 --pitch --pitch-weights football-pitch-detection.pt
+```
+
+Saídas com `--pitch`:
+
+- `pitch_x, pitch_y` no `<nome>_detections.csv`: posição em metros no campo. Para pessoas é o ponto
+  dos pés; para a bola é o centro da caixa, então uma bola no alto cai no gramado atrás dela.
+- `<nome>_pitch.csv`: por quadro analisado, `frame, timestamp, keypoints, homography, fresh, h11..h33`.
+  `homography = 1` quando há homografia válida e `fresh = 0` quando ela foi herdada do quadro anterior.
+- Minimapa do campo no canto inferior direito do vídeo, com jogadores nas cores das equipes, árbitros e bola.
+
+| opção | efeito |
+|---|---|
+| `--pitch` | ativa a detecção do campo e a homografia |
+| `--roboflow-api-key K` | chave do Roboflow (padrão: variável `ROBOFLOW_API_KEY`) |
+| `--pitch-model ID` | modelo no Roboflow (padrão `football-field-detection-f07vi/14`) |
+| `--pitch-weights arq.pt` | usa pesos locais com `ultralytics` em vez do Roboflow |
+| `--pitch-kp-conf 0.5` | confiança mínima de cada ponto do campo |
+| `--pitch-max-age 0.5` | segundos que a última homografia vale quando faltam pontos |
+| `--pitch-show-keypoints` | desenha os pontos detectados no vídeo, para conferir o modelo |
+| `--no-radar` | não desenha o minimapa |
+
+Limitações: o campo de referência tem tamanho fixo, então as distâncias são aproximadas em campos
+de outro tamanho. Em planos fechados ou replays, poucos pontos aparecem e a homografia fica indisponível.
+
 ## Opções principais
 
 | opção | efeito |
