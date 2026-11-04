@@ -65,21 +65,19 @@ Dica: use `--single-ball` e, em 4K, `--tiles 2` com `--class-threshold ball=0.3`
 
 ## Campo e homografia (`--pitch`)
 
-Usa o modelo de pontos-chave do campo do Roboflow
-([football-field-detection](https://universe.roboflow.com/roboflow-jvuqo/football-field-detection-f07vi),
-o mesmo do repositório [roboflow/sports](https://github.com/roboflow/sports)). Ele encontra até 32
-pontos de referência (cantos, áreas, meio-campo, círculo central). Com pelo menos 4 pontos
-confiáveis e não alinhados, o script calcula a homografia que leva cada pixel para metros num
-campo padrão de 120 × 70 m. A homografia é recalculada a cada quadro analisado, porque a câmera se move.
+Usa o modelo de pontos-chave do campo [Soccana](https://huggingface.co/Adit-jain/Soccana_Keypoint)
+(YOLO11n-pose treinado no SoccerNet-Calibration). Ele encontra até 29 pontos de referência:
+cantos, áreas grande e pequena, vértice da meia-lua, linha do meio e círculo central. Com pelo
+menos 4 pontos confiáveis e não alinhados, o script calcula a homografia que leva cada pixel para
+metros num campo FIFA padrão de 105 × 68 m. A homografia é recalculada a cada quadro analisado,
+porque a câmera se move. Os pesos são baixados do Hugging Face na primeira execução.
 
 ```bash
-pip install inference            # ou inference-gpu
-export ROBOFLOW_API_KEY=sua_chave
+pip install ultralytics
 python detect_soccer.py teste_corte23.mp4 --pitch --pitch-show-keypoints
 
-# alternativa sem chave: pesos .pt locais do mesmo modelo (roboflow/sports)
-pip install ultralytics
-python detect_soccer.py teste_corte23.mp4 --pitch --pitch-weights football-pitch-detection.pt
+# pesos já baixados
+python detect_soccer.py teste_corte23.mp4 --pitch --pitch-weights best.pt
 ```
 
 Saídas com `--pitch`:
@@ -96,9 +94,8 @@ Saídas com `--pitch`:
 | opção | efeito |
 |---|---|
 | `--pitch` | ativa a detecção do campo e a homografia |
-| `--roboflow-api-key K` | chave do Roboflow (padrão: variável `ROBOFLOW_API_KEY`) |
-| `--pitch-model ID` | modelo no Roboflow (padrão `football-field-detection-f07vi/14`) |
-| `--pitch-weights arq.pt` | usa pesos locais com `ultralytics` em vez do Roboflow |
+| `--pitch-weights arq.pt` | pesos locais do modelo de campo (padrão: baixa do Hugging Face) |
+| `--pitch-imgsz 640` | resolução de entrada do modelo de campo (a do treino) |
 | `--pitch-kp-conf 0.5` | confiança mínima de cada ponto do campo |
 | `--pitch-max-age 0.5` | segundos que a última homografia vale quando faltam pontos |
 | `--pitch-show-keypoints` | desenha os pontos detectados no vídeo, para conferir o modelo |

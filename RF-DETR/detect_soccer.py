@@ -16,13 +16,12 @@ Exemplos:
   python detect_soccer.py teste_corte23.mp4 --frame-skip 5 --max-frames 300
   python detect_soccer.py jogo.mp4 --weights ./checkpoint.pth --device cuda \
       --class-threshold player=0.7 --class-threshold ball=0.4
-  ROBOFLOW_API_KEY=... python detect_soccer.py teste_corte23.mp4 --pitch   # homografia do campo
+  python detect_soccer.py teste_corte23.mp4 --pitch   # homografia do campo (modelo Soccana)
 """
 from __future__ import annotations
 
 import argparse
 import csv
-import os
 import shutil
 import subprocess
 import sys
@@ -503,102 +502,95 @@ def calibrate_teams(cap, detect, start: int, end: int, n_frames: int, names: lis
 # --------------------------------------------------------------------------- #
 # Campo e homografia
 # --------------------------------------------------------------------------- #
-# Modelo de pontos-chave do campo do Roboflow (32 pontos, mesmo esquema do
-# repositório roboflow/sports): https://universe.roboflow.com/roboflow-jvuqo/football-field-detection-f07vi
-ROBOFLOW_PITCH_MODEL = "football-field-detection-f07vi/14"
+# Modelo de pontos-chave do campo Soccana (YOLO11n-pose, 29 pontos, treinado no
+# SoccerNet-Calibration): https://huggingface.co/Adit-jain/Soccana_Keypoint
+PITCH_HF_REPO = "Adit-jain/Soccana_Keypoint"
+PITCH_HF_FILE = "Model/weights/best.pt"
 
-# Campo padrão em metros (o mesmo do roboflow/sports). Campos reais variam de
-# tamanho; as coordenadas saem nesse campo de referência de 120 x 70 m.
-PITCH_LENGTH, PITCH_WIDTH = 120.0, 70.0
-PENALTY_BOX_W, PENALTY_BOX_L = 41.0, 20.15
+# Campo FIFA padrão em metros. x = comprimento (0 = linha de fundo da esquerda da
+# imagem), y = largura (0 = linha lateral do fundo da imagem, "top" no modelo).
+# Campos reais variam de tamanho; as coordenadas saem nesse campo de referência.
+PITCH_LENGTH, PITCH_WIDTH = 105.0, 68.0
+PENALTY_BOX_W, PENALTY_BOX_L = 40.32, 16.5
 GOAL_BOX_W, GOAL_BOX_L = 18.32, 5.5
 CENTRE_CIRCLE_R, PENALTY_SPOT = 9.15, 11.0
 
 
 def pitch_vertices() -> np.ndarray:
-    """Os 32 pontos de referência do campo, na ordem dos pontos-chave do modelo (x = comprimento)."""
+    """Posição no campo (m) de cada um dos 29 pontos-chave, na ordem de saída do modelo Soccana.
+
+    "pt1" é o ponto na linha de fundo e "pt2" o ponto na linha da área. Os pontos
+    10 e 26 são o vértice da meia-lua (marca do pênalti + raio de 9,15 m).
+    """
     L, W = PITCH_LENGTH, PITCH_WIDTH
     pb1, pb2 = (W - PENALTY_BOX_W) / 2, (W + PENALTY_BOX_W) / 2
     gb1, gb2 = (W - GOAL_BOX_W) / 2, (W + GOAL_BOX_W) / 2
+    arc = PENALTY_SPOT + CENTRE_CIRCLE_R
+    r = CENTRE_CIRCLE_R
     return np.array([
-        (0, 0), (0, pb1), (0, gb1), (0, gb2), (0, pb2), (0, W),                      # 1-6
-        (GOAL_BOX_L, gb1), (GOAL_BOX_L, gb2),                                        # 7-8
-        (PENALTY_SPOT, W / 2),                                                       # 9
-        (PENALTY_BOX_L, pb1), (PENALTY_BOX_L, gb1), (PENALTY_BOX_L, gb2), (PENALTY_BOX_L, pb2),  # 10-13
-        (L / 2, 0), (L / 2, W / 2 - CENTRE_CIRCLE_R), (L / 2, W / 2 + CENTRE_CIRCLE_R), (L / 2, W),  # 14-17
-        (L - PENALTY_BOX_L, pb1), (L - PENALTY_BOX_L, gb1), (L - PENALTY_BOX_L, gb2), (L - PENALTY_BOX_L, pb2),  # 18-21
-        (L - PENALTY_SPOT, W / 2),                                                   # 22
-        (L - GOAL_BOX_L, gb1), (L - GOAL_BOX_L, gb2),                                # 23-24
-        (L, 0), (L, pb1), (L, gb1), (L, gb2), (L, pb2), (L, W),                      # 25-30
-        (L / 2 - CENTRE_CIRCLE_R, W / 2), (L / 2 + CENTRE_CIRCLE_R, W / 2),          # 31-32
+        (0, 0),                                   # 0  sideline_top_left
+        (0, pb1), (PENALTY_BOX_L, pb1),           # 1  big_rect_left_top_pt1, 2 pt2
+        (0, pb2), (PENALTY_BOX_L, pb2),           # 3  big_rect_left_bottom_pt1, 4 pt2
+        (0, gb1), (GOAL_BOX_L, gb1),              # 5  small_rect_left_top_pt1, 6 pt2
+        (0, gb2), (GOAL_BOX_L, gb2),              # 7  small_rect_left_bottom_pt1, 8 pt2
+        (0, W),                                   # 9  sideline_bottom_left
+        (arc, W / 2),                             # 10 left_semicircle_right
+        (L / 2, 0), (L / 2, W),                   # 11 center_line_top, 12 center_line_bottom
+        (L / 2, W / 2 - r), (L / 2, W / 2 + r),   # 13 center_circle_top, 14 center_circle_bottom
+        (L / 2, W / 2),                           # 15 field_center
+        (L, 0),                                   # 16 sideline_top_right
+        (L, pb1), (L - PENALTY_BOX_L, pb1),       # 17 big_rect_right_top_pt1, 18 pt2
+        (L, pb2), (L - PENALTY_BOX_L, pb2),       # 19 big_rect_right_bottom_pt1, 20 pt2
+        (L, gb1), (L - GOAL_BOX_L, gb1),          # 21 small_rect_right_top_pt1, 22 pt2
+        (L, gb2), (L - GOAL_BOX_L, gb2),          # 23 small_rect_right_bottom_pt1, 24 pt2
+        (L, W),                                   # 25 sideline_bottom_right
+        (L - arc, W / 2),                         # 26 right_semicircle_left
+        (L / 2 - r, W / 2), (L / 2 + r, W / 2),   # 27 center_circle_left, 28 center_circle_right
     ], np.float32)
 
 
 PITCH_VERTICES = pitch_vertices()
 N_PITCH_KEYPOINTS = len(PITCH_VERTICES)
-# Linhas do campo para o minimapa (índices 1-based dos pontos acima)
-PITCH_EDGES = [(1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (7, 8), (10, 11), (11, 12), (12, 13),
-               (14, 15), (15, 16), (16, 17), (18, 19), (19, 20), (20, 21), (23, 24), (25, 26),
-               (26, 27), (27, 28), (28, 29), (29, 30), (1, 14), (2, 10), (3, 7), (4, 8),
-               (5, 13), (6, 17), (14, 25), (18, 26), (23, 27), (24, 28), (21, 29), (17, 30)]
+
+
+def download_pitch_weights() -> str:
+    """Baixa o best.pt do Soccana do Hugging Face (fica em cache após a 1ª vez)."""
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        sys.exit("Instale huggingface_hub ou informe --pitch-weights com o caminho do .pt")
+    print(f"[campo] baixando {PITCH_HF_FILE} de {PITCH_HF_REPO}")
+    return hf_hub_download(PITCH_HF_REPO, PITCH_HF_FILE)
 
 
 class PitchKeypointModel:
-    """Detecta os 32 pontos-chave do campo com o modelo do Roboflow.
+    """Detecta os 29 pontos-chave do campo com o modelo Soccana (YOLO11-pose, ultralytics)."""
 
-    Usa o pacote `inference` do Roboflow (precisa de chave de API; os pesos são
-    baixados e a inferência roda localmente) ou, com `weights`, um .pt local do
-    mesmo modelo carregado pelo `ultralytics`.
-    """
-
-    def __init__(self, weights: str | None, api_key: str | None, model_id: str, device: str | None):
-        self.device = device
-        if weights:
-            try:
-                from ultralytics import YOLO
-            except ImportError:
-                sys.exit("--pitch-weights requer o pacote 'ultralytics': pip install ultralytics")
-            print(f"[campo] carregando {weights} (ultralytics)")
-            self.model, self.backend = YOLO(weights), "ultralytics"
-            return
-        key = api_key or os.environ.get("ROBOFLOW_API_KEY")
-        if not key:
-            sys.exit("--pitch requer uma chave do Roboflow (variável ROBOFLOW_API_KEY ou "
-                     "--roboflow-api-key) ou pesos locais com --pitch-weights")
+    def __init__(self, weights: str | None, device: str | None, imgsz: int = 640):
         try:
-            from inference import get_model
+            from ultralytics import YOLO
         except ImportError:
-            sys.exit("--pitch requer o pacote 'inference' do Roboflow: pip install inference "
-                     "(ou inference-gpu)")
-        print(f"[campo] carregando {model_id} (Roboflow)")
-        self.model, self.backend = get_model(model_id=model_id, api_key=key), "roboflow"
+            sys.exit("--pitch requer o pacote 'ultralytics': pip install ultralytics")
+        path = weights or download_pitch_weights()
+        print(f"[campo] carregando {path}")
+        self.model = YOLO(path)
+        self.device = device
+        self.imgsz = imgsz
 
     def __call__(self, frame_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Devolve (32, 2) posições em px e (32,) confianças; confiança 0 = ponto não encontrado."""
+        """Devolve (29, 2) posições em px e (29,) confianças; confiança 0 = ponto não encontrado."""
         xy = np.zeros((N_PITCH_KEYPOINTS, 2), np.float32)
         conf = np.zeros(N_PITCH_KEYPOINTS, np.float32)
-        if self.backend == "ultralytics":
-            kw = {"device": self.device} if self.device else {}
-            r = self.model(frame_bgr, verbose=False, **kw)[0]
-            if r.keypoints is None or len(r.keypoints) == 0:
-                return xy, conf
-            k = int(np.argmax(r.boxes.conf.cpu().numpy())) if r.boxes is not None and len(r.boxes) else 0
-            pts = r.keypoints.xy[k].cpu().numpy()
-            c = r.keypoints.conf[k].cpu().numpy() if r.keypoints.conf is not None else np.ones(len(pts))
-            n = min(N_PITCH_KEYPOINTS, len(pts))
-            xy[:n], conf[:n] = pts[:n], c[:n]
+        kw = {"device": self.device} if self.device else {}
+        r = self.model(frame_bgr, imgsz=self.imgsz, verbose=False, **kw)[0]
+        if r.keypoints is None or len(r.keypoints) == 0:
             return xy, conf
-        res = self.model.infer(frame_bgr, confidence=0.3)
-        res = res[0] if isinstance(res, list) else res
-        preds = getattr(res, "predictions", None) or []
-        if not preds:
-            return xy, conf
-        best = max(preds, key=lambda p: p.confidence)
-        for i, kp in enumerate(best.keypoints):
-            j = getattr(kp, "class_id", None)
-            j = i if j is None else int(j)
-            if 0 <= j < N_PITCH_KEYPOINTS:
-                xy[j], conf[j] = (kp.x, kp.y), kp.confidence
+        # o modelo detecta o campo como um único objeto; fica com a detecção mais confiável
+        k = int(np.argmax(r.boxes.conf.cpu().numpy())) if r.boxes is not None and len(r.boxes) else 0
+        pts = r.keypoints.xy[k].cpu().numpy()
+        c = r.keypoints.conf[k].cpu().numpy() if r.keypoints.conf is not None else np.ones(len(pts))
+        n = min(N_PITCH_KEYPOINTS, len(pts))
+        xy[:n], conf[:n] = pts[:n], c[:n]
         return xy, conf
 
 
@@ -678,7 +670,7 @@ def draw_pitch_keypoints(img: np.ndarray, mapper: PitchMapper) -> None:
     for i in np.flatnonzero(mapper.kp_mask):
         x, y = map(int, mapper.kp_xy[i])
         cv2.circle(img, (x, y), r, (255, 0, 255), -1, cv2.LINE_AA)
-        cv2.putText(img, str(i + 1), (x + r + 2, y - r), cv2.FONT_HERSHEY_SIMPLEX,
+        cv2.putText(img, str(i), (x + r + 2, y - r), cv2.FONT_HERSHEY_SIMPLEX,
                     max(0.4, img.shape[0] / 2700), (255, 0, 255), 1, cv2.LINE_AA)
 
 
@@ -717,11 +709,24 @@ def draw_radar(img: np.ndarray, mapper: PitchMapper, det: Detections, names: lis
         return int(fx0 + (p[0] + pad) * scale), int(fy0 + (p[1] + pad) * scale)
 
     line = (235, 235, 235)
-    for a, b in PITCH_EDGES:
-        cv2.line(img, px(PITCH_VERTICES[a - 1]), px(PITCH_VERTICES[b - 1]), line, 1, cv2.LINE_AA)
-    cv2.circle(img, px((PITCH_LENGTH / 2, PITCH_WIDTH / 2)), int(CENTRE_CIRCLE_R * scale), line, 1, cv2.LINE_AA)
-    for spot in (PENALTY_SPOT, PITCH_LENGTH - PENALTY_SPOT):
-        cv2.circle(img, px((spot, PITCH_WIDTH / 2)), max(1, int(1.5 * s)), line, -1, cv2.LINE_AA)
+    L, Wd = PITCH_LENGTH, PITCH_WIDTH
+
+    def rect(xa, ya, xb, yb) -> None:
+        cv2.rectangle(img, px((xa, ya)), px((xb, yb)), line, 1, cv2.LINE_AA)
+
+    rect(0, 0, L, Wd)
+    cv2.line(img, px((L / 2, 0)), px((L / 2, Wd)), line, 1, cv2.LINE_AA)
+    for bw, bl in ((PENALTY_BOX_W, PENALTY_BOX_L), (GOAL_BOX_W, GOAL_BOX_L)):
+        rect(0, (Wd - bw) / 2, bl, (Wd + bw) / 2)
+        rect(L - bl, (Wd - bw) / 2, L, (Wd + bw) / 2)
+    rr = int(round(CENTRE_CIRCLE_R * scale))
+    cv2.circle(img, px((L / 2, Wd / 2)), rr, line, 1, cv2.LINE_AA)
+    # meia-lua: parte do círculo da marca do pênalti que fica fora da área
+    half = float(np.degrees(np.arccos((PENALTY_BOX_L - PENALTY_SPOT) / CENTRE_CIRCLE_R)))
+    for spot, mid in ((PENALTY_SPOT, 0.0), (L - PENALTY_SPOT, 180.0)):
+        c = px((spot, Wd / 2))
+        cv2.ellipse(img, c, (rr, rr), 0, mid - half, mid + half, line, 1, cv2.LINE_AA)
+        cv2.circle(img, c, max(1, int(1.5 * s)), line, -1, cv2.LINE_AA)
 
     r = max(3, int(6 * s))
     ref_color = CLASS_COLORS["referee"]
@@ -897,7 +902,7 @@ def run(args: argparse.Namespace, detector=None) -> dict:
 
     mapper, pitch_path = None, None
     if args.pitch:
-        kp_model = PitchKeypointModel(args.pitch_weights, args.roboflow_api_key, args.pitch_model, args.device)
+        kp_model = PitchKeypointModel(args.pitch_weights, args.device, args.pitch_imgsz)
         mapper = PitchMapper(kp_model, args.pitch_kp_conf, args.pitch_max_age)
         pitch_path = out_dir / f"{stem}_pitch.csv"
 
@@ -1071,11 +1076,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--team-calib-frames", type=int, default=10,
                    help="quadros amostrados para aprender as cores das equipes (padrão 10)")
     p.add_argument("--pitch", action="store_true",
-                   help="detecta os pontos do campo (modelo do Roboflow) e calcula a homografia para metros")
-    p.add_argument("--roboflow-api-key", help="chave do Roboflow (padrão: variável ROBOFLOW_API_KEY)")
-    p.add_argument("--pitch-model", default=ROBOFLOW_PITCH_MODEL,
-                   help=f"ID do modelo de campo no Roboflow (padrão {ROBOFLOW_PITCH_MODEL})")
-    p.add_argument("--pitch-weights", help="pesos .pt locais do modelo de campo (usa ultralytics, sem chave)")
+                   help="detecta os pontos do campo (modelo Soccana) e calcula a homografia para metros")
+    p.add_argument("--pitch-weights",
+                   help=f"pesos .pt locais do modelo de campo (padrão: baixa {PITCH_HF_FILE} de {PITCH_HF_REPO})")
+    p.add_argument("--pitch-imgsz", type=int, default=640,
+                   help="resolução de entrada do modelo de campo (padrão 640, a do treino)")
     p.add_argument("--pitch-kp-conf", type=float, default=0.5,
                    help="confiança mínima de cada ponto do campo (padrão 0.5)")
     p.add_argument("--pitch-max-age", type=float, default=0.5,
