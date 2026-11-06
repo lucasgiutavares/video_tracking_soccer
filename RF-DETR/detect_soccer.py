@@ -26,7 +26,7 @@ import shutil
 import subprocess
 import sys
 import time
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -674,9 +674,12 @@ def draw_pitch_keypoints(img: np.ndarray, mapper: PitchMapper) -> None:
                     max(0.4, img.shape[0] / 2700), (255, 0, 255), 1, cv2.LINE_AA)
 
 
-def draw_radar(img: np.ndarray, mapper: PitchMapper, det: Detections, names: list[str],
+def draw_radar(img: np.ndarray, pts: np.ndarray | None, det: Detections, names: list[str],
                teams: np.ndarray, team_colors: list | None, holder: int | None) -> None:
     """Painel no canto inferior direito com a posição dos atletas no campo (vista de cima).
+
+    `pts` são as posições em metros de cada detecção (None = campo não identificado;
+    NaN = posição removida pelo filtro de velocidade).
 
     Jogadores: círculo na cor da equipe (contorno vermelho = jogador com a bola).
     Goleiros: quadrado na cor da equipe. Árbitros: círculo preto. Bola: círculo amarelo.
@@ -758,11 +761,10 @@ def draw_radar(img: np.ndarray, mapper: PitchMapper, det: Detections, names: lis
         (tw, _), _ = cv2.getTextSize(label, font, 0.5 * s, t2)
         lx += r + int(6 * s) + tw + int(22 * s) + r
 
-    if not mapper.valid:
+    if pts is None:
         cv2.putText(img, "campo nao identificado", (fx0 + int(10 * s), fy0 + int(26 * s)), font,
                     0.6 * s, (255, 255, 255), t2, cv2.LINE_AA)
         return
-    pts = mapper.to_pitch(anchor_points(det, names))
     order = sorted(range(len(det)), key=lambda i: class_name(names, int(det.class_id[i])) == "ball")
     for i in order:  # bola por último, por cima dos atletas
         x, y = pts[i]
@@ -774,6 +776,155 @@ def draw_radar(img: np.ndarray, mapper: PitchMapper, det: Detections, names: lis
         ring, ring_w = ((0, 0, 255), 2) if i == holder else \
             (((255, 255, 255), 1) if name == "referee" else ((0, 0, 0), 1))
         marker(px((x, y)), name, color, ring, ring_w)
+
+
+# --------------------------------------------------------------------------- #
+# Filtro de velocidade das posições no campo
+# --------------------------------------------------------------------------- #
+PERSON_CLASSES = ("player", "goalkeeper", "referee")
+POS_OK, POS_PENDING, POS_INTERP, POS_REMOVED = 0, 1, 2, 3
+POS_FLAG_LABELS = {POS_OK: "", POS_PENDING: "", POS_INTERP: "interpolado", POS_REMOVED: "removido"}
+
+
+class FrameRecord:
+    """Dados de um quadro analisado, guardados até as posições no campo ficarem definitivas."""
+
+    def __init__(self, idx: int, ts: float, det: Detections, teams: np.ndarray,
+                 holder: int | None, raw: np.ndarray | None):
+        self.idx, self.ts, self.det, self.teams, self.holder = idx, ts, det, teams, holder
+        self.raw = raw                                   # (N, 2) metros, como saiu da homografia
+        self.pts = None if raw is None else raw.copy()   # (N, 2) após o filtro; NaN = removida
+        self.flag = np.zeros(len(det), int)
+        self.track = np.full(len(det), -1, int)
+        self.pending = 0                                 # posições ainda sem decisão
+        self.imgs: list[np.ndarray] = []                 # quadros de vídeo à espera deste registro
+        self.released = False
+
+
+class _Track:
+    def __init__(self, tid: int, box: np.ndarray, ts: float):
+        self.id, self.box, self.seen = tid, box, ts
+        self.anchor: np.ndarray | None = None  # última posição válida (metros)
+        self.anchor_t = 0.0
+        self.pending: list[tuple[FrameRecord, int]] = []
+
+
+class PitchSpeedFilter:
+    """Remove saltos impossíveis na posição de cada atleta no campo e interpola o buraco.
+
+    Os atletas são ligados de um quadro ao outro pela caixa na imagem (distância entre
+    os pés, em alturas de caixa), não pela posição em metros, que é justamente o que pode
+    estar errado. Para cada atleta, se a distância até a última posição válida dividida
+    pelo tempo passado passar de `max_speed` (m/s), a posição fica pendente; quando chega
+    a próxima posição válida, as pendentes viram a interpolação linear entre as duas.
+    Se nenhuma posição válida chegar em `max_gap` segundos, as pendentes são removidas;
+    se as duas últimas pendentes forem coerentes entre si, a mais recente passa a ser a
+    nova referência (a referência antiga é que estava errada).
+    """
+
+    def __init__(self, names: list[str], max_speed: float, max_gap: float, match_dist: float):
+        self.names = names
+        self.max_speed, self.max_gap, self.match_dist = max_speed, max_gap, match_dist
+        self.tracks: list[_Track] = []
+        self.next_id = 0
+        self.n_checked = self.n_interp = self.n_removed = 0
+
+    def update(self, rec: FrameRecord) -> None:
+        people = [k for k, c in enumerate(rec.det.class_id)
+                  if class_name(self.names, int(c)) in PERSON_CLASSES]
+        self._associate(rec, people)
+        if rec.pts is not None:
+            by_id = {tr.id: tr for tr in self.tracks}
+            for k in people:
+                self._check(by_id[int(rec.track[k])], rec, k)
+        self._expire(rec.ts)
+
+    def flush(self) -> None:
+        """Fim do vídeo: pendentes sem próxima posição válida são removidas."""
+        for tr in self.tracks:
+            for r, j in tr.pending:
+                self._finish(r, j, POS_REMOVED, np.nan)
+            tr.pending = []
+
+    def _associate(self, rec: FrameRecord, people: list[int]) -> None:
+        boxes = rec.det.xyxy[people]
+        cands = []
+        for ti, tr in enumerate(self.tracks):
+            for j, b in enumerate(boxes):
+                h = ((tr.box[3] - tr.box[1]) + (b[3] - b[1])) / 2
+                d = float(np.hypot((tr.box[0] + tr.box[2] - b[0] - b[2]) / 2, tr.box[3] - b[3]))
+                if h > 0 and d <= self.match_dist * h:
+                    cands.append((d / h, ti, j))
+        cands.sort()
+        used_t, used_d = set(), set()
+        for _, ti, j in cands:
+            if ti in used_t or j in used_d:
+                continue
+            used_t.add(ti)
+            used_d.add(j)
+            self._assign(self.tracks[ti], rec, people[j])
+        for j, k in enumerate(people):
+            if j not in used_d:
+                tr = _Track(self.next_id, rec.det.xyxy[k], rec.ts)
+                self.next_id += 1
+                self.tracks.append(tr)
+                self._assign(tr, rec, k)
+
+    @staticmethod
+    def _assign(tr: _Track, rec: FrameRecord, k: int) -> None:
+        tr.box, tr.seen = rec.det.xyxy[k].copy(), rec.ts
+        rec.track[k] = tr.id
+
+    def _fast(self, a: np.ndarray, ta: float, b: np.ndarray, tb: float) -> bool:
+        return float(np.linalg.norm(b - a)) > self.max_speed * (tb - ta)
+
+    def _check(self, tr: _Track, rec: FrameRecord, k: int) -> None:
+        p, t = rec.raw[k], rec.ts
+        self.n_checked += 1
+        if not np.isfinite(p).all():
+            rec.pending += 1
+            self._finish(rec, k, POS_REMOVED, np.nan)
+            return
+        if tr.anchor is None or not self._fast(tr.anchor, tr.anchor_t, p, t):
+            for r, j in tr.pending:  # buraco fechado: interpola entre as duas posições válidas
+                a = (r.ts - tr.anchor_t) / (t - tr.anchor_t)
+                self._finish(r, j, POS_INTERP, tr.anchor + a * (p - tr.anchor))
+            tr.pending = []
+            tr.anchor, tr.anchor_t = p.copy(), t
+        else:
+            rec.flag[k] = POS_PENDING
+            rec.pending += 1
+            tr.pending.append((rec, k))
+
+    def _expire(self, now: float) -> None:
+        keep = []
+        for tr in self.tracks:
+            lost = now - tr.seen > self.max_gap
+            if tr.pending and (lost or now - tr.pending[0][0].ts > self.max_gap):
+                newest = None
+                if not lost and len(tr.pending) >= 2:
+                    (r1, j1), (r2, j2) = tr.pending[-2:]
+                    if not self._fast(r1.raw[j1], r1.ts, r2.raw[j2], r2.ts):
+                        newest = tr.pending.pop()
+                for r, j in tr.pending:
+                    self._finish(r, j, POS_REMOVED, np.nan)
+                tr.pending = []
+                if newest:
+                    r, j = newest
+                    self._finish(r, j, POS_OK, r.raw[j])
+                    tr.anchor, tr.anchor_t = r.raw[j].copy(), r.ts
+            if not lost:
+                keep.append(tr)
+        self.tracks = keep
+
+    def _finish(self, rec: FrameRecord, k: int, flag: int, value) -> None:
+        rec.pts[k] = value
+        rec.flag[k] = flag
+        rec.pending -= 1
+        if flag == POS_INTERP:
+            self.n_interp += 1
+        elif flag == POS_REMOVED:
+            self.n_removed += 1
 
 
 # --------------------------------------------------------------------------- #
@@ -796,9 +947,14 @@ class VideoSink:
         else:
             self.writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, size)
 
-    def write(self, frame: np.ndarray) -> None:
+    def fit(self, frame: np.ndarray) -> np.ndarray:
+        """Redimensiona para o tamanho de saída (para guardar quadros pequenos no buffer)."""
         if frame.shape[1::-1] != self.size:
             frame = cv2.resize(frame, self.size, interpolation=cv2.INTER_AREA)
+        return frame
+
+    def write(self, frame: np.ndarray) -> None:
+        frame = self.fit(frame)
         if self.proc:
             self.proc.stdin.write(frame.tobytes())
         else:
@@ -817,7 +973,7 @@ class VideoSink:
 # --------------------------------------------------------------------------- #
 CSV_FIELDS = ["frame", "timestamp", "class_id", "class_name", "confidence",
               "x1", "y1", "x2", "y2", "width", "height", "center_x", "center_y", "area", "team",
-              "pitch_x", "pitch_y"]
+              "pitch_x", "pitch_y", "pitch_flag", "pitch_x_raw", "pitch_y_raw", "track_id"]
 POSSESSION_FIELDS = ["frame", "timestamp", "ball_detected", "team_near_ball", "possession_team",
                      "seconds_A", "seconds_B", "pct_A", "pct_B"]
 PITCH_FIELDS = ["frame", "timestamp", "keypoints", "homography", "fresh",
@@ -905,6 +1061,9 @@ def run(args: argparse.Namespace, detector=None) -> dict:
         kp_model = PitchKeypointModel(args.pitch_weights, args.device, args.pitch_imgsz)
         mapper = PitchMapper(kp_model, args.pitch_kp_conf, args.pitch_max_age)
         pitch_path = out_dir / f"{stem}_pitch.csv"
+    speed_filter = None
+    if mapper and args.max_speed > 0:
+        speed_filter = PitchSpeedFilter(names, args.max_speed, args.max_gap, args.track_match_dist)
 
     sink = None
     if not args.no_video:
@@ -918,6 +1077,8 @@ def run(args: argparse.Namespace, detector=None) -> dict:
     infer_time = 0.0
     last = Detections.empty()
     last_teams = np.zeros(0, int)
+    queue: deque[FrameRecord] = deque()  # quadros à espera do filtro de velocidade
+    last_rec: FrameRecord | None = None
     t0 = time.time()
     dt = args.frame_skip / fps  # segundos de vídeo representados por quadro analisado
 
@@ -930,6 +1091,49 @@ def run(args: argparse.Namespace, detector=None) -> dict:
     if pitch_writer:
         pitch_writer.writeheader()
     pitch_frames_ok = 0
+
+    def fmt(v) -> float | str:
+        return round(float(v), 2) if np.isfinite(v) else ""
+
+    def write_rows(rec: FrameRecord) -> None:
+        det = rec.det
+        for k, ((x1, y1, x2, y2), conf, cid) in enumerate(zip(det.xyxy, det.confidence, det.class_id)):
+            name = class_name(names, int(cid))
+            counts[name] += 1
+            w, h = x2 - x1, y2 - y1
+            has = rec.pts is not None
+            writer.writerow({
+                "frame": rec.idx, "timestamp": round(rec.ts, 3), "class_id": int(cid),
+                "class_name": name, "confidence": round(float(conf), 4),
+                "x1": round(float(x1), 1), "y1": round(float(y1), 1),
+                "x2": round(float(x2), 1), "y2": round(float(y2), 1),
+                "width": round(float(w), 1), "height": round(float(h), 1),
+                "center_x": round(float(x1 + w / 2), 1), "center_y": round(float(y1 + h / 2), 1),
+                "area": round(float(w * h), 1),
+                "team": TEAM_SHORT[rec.teams[k]] if rec.teams[k] >= 0 else "",
+                "pitch_x": fmt(rec.pts[k, 0]) if has else "",
+                "pitch_y": fmt(rec.pts[k, 1]) if has else "",
+                "pitch_flag": POS_FLAG_LABELS[int(rec.flag[k])] if has else "",
+                "pitch_x_raw": fmt(rec.raw[k, 0]) if has else "",
+                "pitch_y_raw": fmt(rec.raw[k, 1]) if has else "",
+                "track_id": int(rec.track[k]) if rec.track[k] >= 0 else "",
+            })
+
+    def finish_img(rec: FrameRecord, img: np.ndarray) -> None:
+        if mapper and not args.no_radar:
+            draw_radar(img, rec.pts, rec.det, names, rec.teams,
+                       teams_clf.colors if teams_clf else None, rec.holder)
+        sink.write(img)
+
+    def release() -> None:
+        """Grava, em ordem, os quadros cujas posições no campo já estão decididas."""
+        while queue and queue[0].pending == 0:
+            rec = queue.popleft()
+            write_rows(rec)
+            for img in rec.imgs:
+                finish_img(rec, img)
+            rec.imgs = []
+            rec.released = True
 
     with open(csv_path, "w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=CSV_FIELDS)
@@ -969,42 +1173,34 @@ def run(args: argparse.Namespace, detector=None) -> dict:
                         "seconds_A": round(tracker.seconds[0], 3), "seconds_B": round(tracker.seconds[1], 3),
                         "pct_A": round(pct[0], 2), "pct_B": round(pct[1], 2),
                     })
-                for k, ((x1, y1, x2, y2), conf, cid) in enumerate(zip(det.xyxy, det.confidence, det.class_id)):
-                    name = class_name(names, int(cid))
-                    counts[name] += 1
-                    w, h = x2 - x1, y2 - y1
-                    writer.writerow({
-                        "frame": idx, "timestamp": round(ts, 3), "class_id": int(cid),
-                        "class_name": name, "confidence": round(float(conf), 4),
-                        "x1": round(float(x1), 1), "y1": round(float(y1), 1),
-                        "x2": round(float(x2), 1), "y2": round(float(y2), 1),
-                        "width": round(float(w), 1), "height": round(float(h), 1),
-                        "center_x": round(float(x1 + w / 2), 1), "center_y": round(float(y1 + h / 2), 1),
-                        "area": round(float(w * h), 1),
-                        "team": TEAM_SHORT[last_teams[k]] if last_teams[k] >= 0 else "",
-                        "pitch_x": round(float(pitch_pts[k, 0]), 2) if pitch_pts is not None else "",
-                        "pitch_y": round(float(pitch_pts[k, 1]), 2) if pitch_pts is not None else "",
-                    })
+                last_rec = FrameRecord(idx, ts, det, last_teams, tracker.holder if tracker else None,
+                                       pitch_pts)
+                if speed_filter:
+                    speed_filter.update(last_rec)
+                queue.append(last_rec)
             if sink and (run_model or args.reuse_detections):
                 if tracker:
                     img = annotate(frame, last, names, not args.hide_conf, last_teams,
-                                   teams_clf.colors, tracker.holder)
+                                   teams_clf.colors, last_rec.holder)
                     draw_possession_panel(img, tracker, teams_clf.colors)
                 else:
                     img = annotate(frame, last, names, not args.hide_conf)
-                if mapper:
-                    if args.pitch_show_keypoints:
-                        draw_pitch_keypoints(img, mapper)
-                    if not args.no_radar:
-                        draw_radar(img, mapper, last, names, last_teams,
-                                   teams_clf.colors if teams_clf else None,
-                                   tracker.holder if tracker else None)
-                sink.write(img)
+                if mapper and args.pitch_show_keypoints:
+                    draw_pitch_keypoints(img, mapper)
+                img = sink.fit(img)  # o minimapa é desenhado quando as posições ficam definitivas
+                if last_rec.released:
+                    finish_img(last_rec, img)
+                else:
+                    last_rec.imgs.append(img)
+            release()
             if run_model and frames_done % 10 == 0:
                 el = time.time() - t0
                 n_left = (end - idx - 1) / args.frame_skip
                 print(f"  quadro {idx}/{end - 1} | {frames_done / el:.2f} q/s | "
                       f"restam ~{n_left * el / frames_done:.0f}s", flush=True)
+        if speed_filter:
+            speed_filter.flush()
+        release()
 
     cap.release()
     if sink:
@@ -1037,6 +1233,12 @@ def run(args: argparse.Namespace, detector=None) -> dict:
         print(f"\nHomografia do campo (CSV: {pitch_path}): {pitch_frames_ok}/{frames_done} "
               f"quadros ({100 * ratio:.0f}%)")
         pitch = {"frames_ok": pitch_frames_ok, "ratio": ratio, "csv": str(pitch_path)}
+        if speed_filter:
+            sf = speed_filter
+            print(f"Filtro de velocidade (> {args.max_speed:g} m/s): {sf.n_checked} posições de atletas, "
+                  f"{sf.n_interp} interpoladas, {sf.n_removed} removidas")
+            pitch.update(speed_checked=sf.n_checked, speed_interpolated=sf.n_interp,
+                         speed_removed=sf.n_removed)
     return {"frames": frames_done, "counts": dict(counts), "csv": str(csv_path),
             "video": str(video_path) if sink else None, "possession": possession, "pitch": pitch}
 
@@ -1088,6 +1290,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pitch-show-keypoints", action="store_true",
                    help="desenha no vídeo os pontos do campo detectados")
     p.add_argument("--no-radar", action="store_true", help="não desenha o minimapa do campo")
+    p.add_argument("--max-speed", type=float, default=11.0,
+                   help="velocidade máx. de um atleta no campo, em m/s; posições acima disso são "
+                        "removidas e interpoladas até a próxima válida (padrão 11; 0 desativa)")
+    p.add_argument("--max-gap", type=float, default=1.0,
+                   help="segundos máx. esperando a próxima posição válida para interpolar; "
+                        "depois disso as posições são removidas (padrão 1)")
+    p.add_argument("--track-match-dist", type=float, default=1.0,
+                   help="distância máx. entre os pés de um atleta em quadros analisados seguidos, "
+                        "em alturas de caixa, para considerá-lo o mesmo (padrão 1)")
     return p
 
 

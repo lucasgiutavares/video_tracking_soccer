@@ -84,6 +84,13 @@ Saídas com `--pitch`:
 
 - `pitch_x, pitch_y` no `<nome>_detections.csv`: posição em metros no campo. Para pessoas é o ponto
   dos pés; para a bola é o centro da caixa, então uma bola no alto cai no gramado atrás dela.
+- Filtro de velocidade (jogadores, goleiros e árbitros): cada atleta é seguido de um quadro ao
+  outro pela caixa na imagem (`track_id`). Se a posição pular mais rápido que `--max-speed`
+  (11 m/s) em relação à última posição válida, ela é removida e substituída pela interpolação
+  linear até a próxima posição válida (`pitch_flag = interpolado`). Se nenhuma posição válida
+  chegar em `--max-gap` segundos, fica vazia (`pitch_flag = removido`). `pitch_x_raw, pitch_y_raw`
+  guardam o valor original da homografia. O minimapa usa as posições já filtradas, por isso o
+  vídeo e o CSV são gravados com um atraso de até `--max-gap` segundos.
 - `<nome>_pitch.csv`: por quadro analisado, `frame, timestamp, keypoints, homography, fresh, h11..h33`.
   `homography = 1` quando há homografia válida e `fresh = 0` quando ela foi herdada do quadro anterior.
 - Painel **POSICIONAMENTO** no canto inferior direito do vídeo: vista de cima do campo com a
@@ -100,6 +107,9 @@ Saídas com `--pitch`:
 | `--pitch-max-age 0.5` | segundos que a última homografia vale quando faltam pontos |
 | `--pitch-show-keypoints` | desenha os pontos detectados no vídeo, para conferir o modelo |
 | `--no-radar` | não desenha o minimapa |
+| `--max-speed 11` | velocidade máx. de um atleta (m/s); acima disso a posição é interpolada (0 desativa) |
+| `--max-gap 1.0` | segundos máx. esperando a próxima posição válida para interpolar |
+| `--track-match-dist 1.0` | distância máx. dos pés entre quadros analisados, em alturas de caixa, para ser o mesmo atleta |
 
 Limitações: o campo de referência tem tamanho fixo, então as distâncias são aproximadas em campos
 de outro tamanho. Em planos fechados ou replays, poucos pontos aparecem e a homografia fica indisponível.
