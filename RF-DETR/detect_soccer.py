@@ -591,24 +591,143 @@ class PitchKeypointModel:
         c = r.keypoints.conf[k].cpu().numpy() if r.keypoints.conf is not None else np.ones(len(pts))
         n = min(N_PITCH_KEYPOINTS, len(pts))
         xy[:n], conf[:n] = pts[:n], c[:n]
-        return xy, conf
+        return xy, drop_border_keypoints(xy, conf, frame_bgr.shape[1], frame_bgr.shape[0])
+
+
+def drop_border_keypoints(xy: np.ndarray, conf: np.ndarray, w: int, h: int, margin: float = 3.0) -> np.ndarray:
+    """Zera a confiança de pontos colados na borda da imagem.
+
+    O modelo prende na borda os pontos que caem fora do quadro, muitas vezes com
+    confiança alta; usá-los distorce a homografia.
+    """
+    edge = (xy[:, 0] <= margin) | (xy[:, 1] <= margin) | (xy[:, 0] >= w - 1 - margin) | (xy[:, 1] >= h - 1 - margin)
+    return np.where(edge, 0.0, conf).astype(np.float32)
+
+
+# Pontos mal definidos pelo modelo (vértice da meia-lua e tangentes do círculo central)
+# pesam menos no ajuste da homografia.
+PITCH_KP_WEIGHT = np.ones(N_PITCH_KEYPOINTS, np.float64)
+PITCH_KP_WEIGHT[[10, 13, 14, 26, 27, 28]] = 0.5
+
+
+def project_h(H: np.ndarray, pts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Aplica H a pontos (N, 2); devolve (N, 2) projetados e (N,) componente w (w <= 0 = além do horizonte)."""
+    p = np.c_[pts, np.ones(len(pts))] @ H.T
+    w = p[:, 2]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return p[:, :2] / w[:, None], w
+
+
+def weighted_homography(src: np.ndarray, dst: np.ndarray, weights: np.ndarray) -> np.ndarray | None:
+    """Homografia src -> dst por DLT ponderado, com normalização de Hartley."""
+    def normalizer(p: np.ndarray) -> np.ndarray:
+        c = p.mean(0)
+        s = np.sqrt(2) / max(np.linalg.norm(p - c, axis=1).mean(), 1e-9)
+        return np.array([[s, 0, -s * c[0]], [0, s, -s * c[1]], [0, 0, 1]])
+
+    Ts, Td = normalizer(src), normalizer(dst)
+    a = (np.c_[src, np.ones(len(src))] @ Ts.T)[:, :2]
+    b = (np.c_[dst, np.ones(len(dst))] @ Td.T)[:, :2]
+    x, y, u, v = a[:, 0], a[:, 1], b[:, 0], b[:, 1]
+    z, o = np.zeros_like(x), np.ones_like(x)
+    A = np.concatenate([np.stack([-x, -y, -o, z, z, z, u * x, u * y, u], 1),
+                        np.stack([z, z, z, -x, -y, -o, v * x, v * y, v], 1)])
+    A *= np.sqrt(np.tile(weights, 2))[:, None]
+    H = np.linalg.inv(Td) @ np.linalg.svd(A)[2][-1].reshape(3, 3) @ Ts
+    if not np.isfinite(H).all() or abs(np.linalg.det(H)) < 1e-15:
+        return None
+    return H
+
+
+class CameraMotion:
+    """Movimento da câmera entre quadros analisados seguidos, como homografia px -> px.
+
+    A câmera de transmissão gira e dá zoom em torno de um ponto fixo, então o
+    movimento de toda a imagem (gramado e arquibancada) é uma homografia. Usa
+    fluxo óptico (Lucas-Kanade, ida e volta) fora das caixas dos atletas, que se
+    movem por conta própria, e RANSAC para descartar o placar e outros elementos fixos.
+    """
+
+    def __init__(self, width: int = 960):
+        self.width = width
+        self.prev: np.ndarray | None = None
+        self.prev_mask: np.ndarray | None = None
+
+    def __call__(self, frame: np.ndarray, boxes: np.ndarray) -> np.ndarray | None:
+        s = min(1.0, self.width / frame.shape[1])
+        small = cv2.resize(frame, None, fx=s, fy=s, interpolation=cv2.INTER_AREA) if s < 1 else frame
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        mask = np.full(gray.shape, 255, np.uint8)
+        for x1, y1, x2, y2 in np.asarray(boxes, np.float64).reshape(-1, 4) * s:
+            pad = 0.15 * (y2 - y1)
+            mask[max(0, int(y1 - pad)):int(y2 + pad) + 1, max(0, int(x1 - pad)):int(x2 + pad) + 1] = 0
+        M = None
+        if self.prev is not None and self.prev.shape == gray.shape:
+            M = self._estimate(self.prev, gray, self.prev_mask, s)
+        self.prev, self.prev_mask = gray, mask
+        return M
+
+    @staticmethod
+    def _estimate(prev: np.ndarray, cur: np.ndarray, mask: np.ndarray, s: float) -> np.ndarray | None:
+        p0 = cv2.goodFeaturesToTrack(prev, 800, 0.01, 8, mask=mask, blockSize=7)
+        if p0 is None or len(p0) < 30:
+            return None
+        lk = dict(winSize=(21, 21), maxLevel=3,
+                  criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
+        p1, st, _ = cv2.calcOpticalFlowPyrLK(prev, cur, p0, None, **lk)
+        p0b, stb, _ = cv2.calcOpticalFlowPyrLK(cur, prev, p1, None, **lk)
+        ok = (st.ravel() == 1) & (stb.ravel() == 1) & (np.linalg.norm((p0 - p0b).reshape(-1, 2), axis=1) < 0.7)
+        if ok.sum() < 30:
+            return None
+        Ms, inl = cv2.findHomography(p0[ok], p1[ok], cv2.RANSAC, 1.0)
+        if Ms is None or inl.sum() < max(25, 0.5 * ok.sum()):
+            return None
+        S = np.diag([s, s, 1.0])
+        return np.linalg.inv(S) @ Ms @ S
 
 
 class PitchMapper:
-    """Homografia quadro -> campo (metros), recalculada a cada quadro analisado.
+    """Homografia quadro -> campo (metros), estável entre quadros.
 
-    Precisa de pelo menos 4 pontos-chave confiáveis que não estejam alinhados.
-    Se um quadro não tiver pontos suficientes, mantém a última homografia por até
-    `max_age` segundos (a câmera se move, então uma homografia velha fica errada).
+    A cada quadro analisado:
+      1. prevê a homografia pelo movimento da câmera (fluxo óptico): H_pred = H_ant · M⁻¹;
+      2. ajusta H_obs nos pontos-chave do modelo (RANSAC + DLT ponderado pela confiança);
+      3. valida H_obs: erro de reprojeção, horizonte, orientação, área visível e
+         coerência com H_pred (salto máximo em metros);
+      4. funde H_obs com H_pred (`smooth` = peso da previsão). Sem observação completa,
+         corrige a previsão com os pontos visíveis (translação/similaridade na imagem)
+         ou segue só com H_pred, por até `flow_max_age` s desde a última observação;
+         sem fluxo nem pontos, mantém a última H por até `max_age` s.
+    Se a observação for rejeitada por salto `reset_after` vezes seguidas, a previsão
+    é considerada perdida e a observação é aceita direto (ressincroniza).
     """
 
-    def __init__(self, model: PitchKeypointModel, kp_conf: float, max_age: float):
+    def __init__(self, model: PitchKeypointModel, kp_conf: float, max_age: float, *,
+                 ransac_thr: float = 2.0, max_reproj: float = 2.0, max_jump: float = 3.0,
+                 smooth: float = 0.5, flow: bool = True, flow_max_age: float = 10.0,
+                 reset_after: int = 3):
         self.model = model
         self.kp_conf = kp_conf
         self.max_age = max_age
+        self.ransac_thr = ransac_thr
+        self.max_reproj = max_reproj
+        self.max_jump = max_jump
+        self.smooth = smooth
+        self.flow_max_age = flow_max_age
+        self.reset_after = reset_after
+        self.motion = CameraMotion() if flow else None
         self.H: np.ndarray | None = None
-        self.age = float("inf")
-        self.fresh = False  # homografia calculada neste quadro (não herdada)
+        self.age = float("inf")   # s desde a última observação aceita
+        self.hold = 0.0           # s sem nenhuma atualização (nem fluxo)
+        self.n_jump_rejects = 0   # observações seguidas rejeitadas por salto
+        self.img_size = (1, 1)
+        self._ref = np.zeros((0, 2))
+        self.fresh = False        # observação aceita neste quadro
+        self.source = "none"      # none | obs | fused | partial | flow | hold
+        self.rejected = ""        # motivo da rejeição da observação deste quadro
+        self.n_inliers = 0
+        self.reproj = float("nan")
+        self.jump = float("nan")  # distância (m) entre H_obs e a previsão
         self.kp_xy = np.zeros((N_PITCH_KEYPOINTS, 2), np.float32)
         self.kp_mask = np.zeros(N_PITCH_KEYPOINTS, bool)
 
@@ -620,30 +739,187 @@ class PitchMapper:
     def n_points(self) -> int:
         return int(self.kp_mask.sum())
 
-    def update(self, frame: np.ndarray, dt: float) -> None:
+    def update(self, frame: np.ndarray, dt: float, boxes: np.ndarray | None = None) -> None:
+        h, w = frame.shape[:2]
+        if self.img_size != (w, h):
+            self.img_size = (w, h)
+            gx, gy = np.meshgrid(np.linspace(0.05, 0.95, 6) * w, np.linspace(0.45, 1.0, 4) * h)
+            self._ref = np.stack([gx.ravel(), gy.ravel()], 1)
+        M = self.motion(frame, np.zeros((0, 4)) if boxes is None else boxes) if self.motion else None
+        H_pred = None
+        if self.H is not None and M is not None:
+            H_pred = self._normalize(self.H @ np.linalg.inv(M))
+            if self._implausible(H_pred):
+                H_pred = None
+
         xy, conf = self.model(frame)
         self.kp_xy, self.kp_mask = xy, conf >= self.kp_conf
-        H = self._fit(xy[self.kp_mask], PITCH_VERTICES[self.kp_mask])
-        self.fresh = H is not None
-        if H is not None:
-            self.H, self.age = H, 0.0
-        else:
-            self.age += dt
-            if self.age > self.max_age:
-                self.H = None
+        H_obs = self._observe(xy, conf)
+        self.jump = float("nan")
+        if H_obs is not None and H_pred is not None:
+            self.jump = self._distance(H_obs, H_pred)
+            if not self.jump <= self.max_jump:
+                self.n_jump_rejects += 1
+                if self.n_jump_rejects < self.reset_after:
+                    H_obs, self.rejected = None, "salto"
+                else:
+                    H_pred = None  # previsão perdida: ressincroniza na observação
 
-    @staticmethod
-    def _fit(src: np.ndarray, dst: np.ndarray) -> np.ndarray | None:
-        if len(src) < 4:
+        self.fresh = H_obs is not None
+        if H_obs is not None:
+            if H_pred is not None and self.smooth > 0:
+                self.H, self.source = self._blend(H_pred, H_obs, self.smooth), "fused"
+            else:
+                self.H, self.source = H_obs, "obs"
+            self.age = self.hold = 0.0
+            self.n_jump_rejects = 0
+        else:
+            alive = self.age + dt <= self.flow_max_age
+            # previsão pelo fluxo; se o fluxo falhou (movimento brusco), a última H
+            base = H_pred if H_pred is not None else self.H
+            H_corr = self._correct(base, xy) if base is not None and alive else None
+            self.age += dt
+            if H_corr is not None:
+                if H_pred is not None and self.smooth > 0:
+                    H_corr = self._blend(H_pred, H_corr, self.smooth)
+                self.H, self.source = H_corr, "partial"
+                self.hold = 0.0
+            elif H_pred is not None and alive:
+                self.H, self.source = H_pred, "flow"
+                self.hold = 0.0
+            else:
+                self.hold += dt
+                # com fluxo funcionando mas vencido, a H congelada estaria errada: descarta
+                if self.H is not None and H_pred is None and self.hold <= self.max_age:
+                    self.source = "hold"
+                else:
+                    self.H, self.source = None, "none"
+
+    def _correct(self, H_base: np.ndarray, xy: np.ndarray) -> np.ndarray | None:
+        """Corrige H_base com os poucos pontos-chave visíveis (menos de 4, ou alinhados).
+
+        Projeta os pontos do campo na imagem por H_base e ajusta uma transformação de
+        baixa ordem na imagem até as posições detectadas: translação (1 ponto) ou
+        similaridade (2+ pontos: translação, escala e rotação). Cobre a deriva do
+        fluxo óptico e as falhas dele em movimentos bruscos da câmera.
+        """
+        m = self.kp_mask
+        if not m.any():
             return None
+        pred, _ = project_h(np.linalg.inv(H_base), PITCH_VERTICES[m].astype(np.float64))
+        obs = xy[m].astype(np.float64)
+        if not np.isfinite(pred).all():
+            return None
+        tol = 0.01 * self.img_size[0]
+        if len(obs) == 1:
+            S = np.c_[np.eye(2), obs[0] - pred[0]]
+        else:
+            method = cv2.RANSAC if len(obs) >= 3 else cv2.LMEDS
+            S, _ = cv2.estimateAffinePartial2D(pred, obs, method=method, ransacReprojThreshold=tol)
+            if S is None:
+                return None
+            fit = pred @ S[:, :2].T + S[:, 2]
+            if np.median(np.linalg.norm(fit - obs, axis=1)) > tol:
+                return None
+            scale = np.sqrt(abs(np.linalg.det(S[:, :2])))
+            if not 0.67 <= scale <= 1.5 or abs(np.arctan2(S[1, 0], S[0, 0])) > np.radians(10):
+                return None
+        H = self._normalize(H_base @ np.linalg.inv(np.vstack([S, [0, 0, 1]])))
+        return None if self._implausible(H) else H
+
+    def _observe(self, xy: np.ndarray, conf: np.ndarray) -> np.ndarray | None:
+        """Ajusta e valida a homografia dos pontos-chave deste quadro; None se não servir."""
+        self.rejected, self.n_inliers, self.reproj = "", 0, float("nan")
+        m = self.kp_mask
+        if m.sum() < 4:
+            self.rejected = "poucos pontos" if m.any() else "sem pontos"
+            return None
+        src = xy[m].astype(np.float64)
+        dst = PITCH_VERTICES[m].astype(np.float64)
+        wts = conf[m].astype(np.float64) * PITCH_KP_WEIGHT[m]
         # pontos quase alinhados (ex.: só a linha do meio) dão homografia degenerada
-        if cv2.contourArea(cv2.convexHull(dst.reshape(-1, 1, 2))) < 20.0:
+        if cv2.contourArea(cv2.convexHull(dst.astype(np.float32))) < 20.0:
+            self.rejected = "pontos alinhados"
             return None
-        method = cv2.RANSAC if len(src) >= 6 else 0
-        H, _ = cv2.findHomography(src.reshape(-1, 1, 2), dst.reshape(-1, 1, 2), method, 2.0)
-        if H is None or not np.isfinite(H).all() or abs(np.linalg.det(H)) < 1e-12:
+        inl = np.ones(len(src), bool)
+        if len(src) >= 5:
+            H0, mask = cv2.findHomography(src, dst, cv2.RANSAC, self.ransac_thr)
+            if H0 is None:
+                self.rejected = "ransac"
+                return None
+            inl = mask.ravel().astype(bool)
+            if inl.sum() < 4:
+                self.rejected = "ransac"
+                return None
+            if cv2.contourArea(cv2.convexHull(dst[inl].astype(np.float32))) < 20.0:
+                self.rejected = "pontos alinhados"  # ex.: só a linha do meio sobrou como consenso
+                return None
+        H = weighted_homography(src[inl], dst[inl], wts[inl])
+        if H is None:
+            self.rejected = "degenerada"
+            return None
+        H = self._normalize(H)
+        err = np.linalg.norm(project_h(H, src[inl])[0] - dst[inl], axis=1)
+        self.n_inliers, self.reproj = int(inl.sum()), float(err.mean())
+        if not self.reproj <= self.max_reproj:
+            self.rejected = "reprojeção"
+            return None
+        why = self._implausible(H)
+        if why:
+            self.rejected = why
             return None
         return H
+
+    def _normalize(self, H: np.ndarray) -> np.ndarray:
+        """Escala H para w = 1 no centro da base da imagem (o gramado fica com w > 0)."""
+        w, h = self.img_size
+        return H / (H[2] @ [w / 2, h, 1.0])
+
+    def _implausible(self, H: np.ndarray) -> str:
+        """Motivo para descartar H como fisicamente impossível; '' se plausível."""
+        w, h = self.img_size
+        quad = np.array([[0, h], [w, h], [w, 0.5 * h], [0, 0.5 * h]], np.float64)
+        p, z = project_h(H, quad)
+        if not np.isfinite(p).all() or (z <= 0).any():
+            return "horizonte"
+        # sem espelhamento: imagem e campo têm x para a direita e y para baixo (câmera no lado y = W)
+        c = np.array([[w / 2, 0.75 * h], [w / 2 + 1, 0.75 * h], [w / 2, 0.75 * h + 1]])
+        q, _ = project_h(H, c)
+        a, b = q[1] - q[0], q[2] - q[0]
+        if a[0] * b[1] - a[1] * b[0] <= 0:
+            return "espelhada"
+        area = cv2.contourArea(p.astype(np.float32))
+        if not 30.0 <= area <= 4 * PITCH_LENGTH * PITCH_WIDTH:
+            return "área visível"
+        m = 40.0
+        if ((p[:, 0] < -m) | (p[:, 0] > PITCH_LENGTH + m) | (p[:, 1] < -m) | (p[:, 1] > PITCH_WIDTH + m)).any():
+            return "fora do campo"
+        return ""
+
+    def _ref_pairs(self, Ha: np.ndarray, Hb: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Pontos de referência do gramado projetados pelas duas homografias (só os válidos em ambas)."""
+        pa, za = project_h(Ha, self._ref)
+        pb, zb = project_h(Hb, self._ref)
+        m = 30.0
+        ok = (za > 0) & (zb > 0)
+        for p in (pa, pb):
+            ok &= (p[:, 0] > -m) & (p[:, 0] < PITCH_LENGTH + m) & (p[:, 1] > -m) & (p[:, 1] < PITCH_WIDTH + m)
+        return self._ref[ok], pa[ok], pb[ok]
+
+    def _distance(self, Ha: np.ndarray, Hb: np.ndarray) -> float:
+        """Distância média (m) entre as projeções do gramado visível pelas duas homografias."""
+        _, pa, pb = self._ref_pairs(Ha, Hb)
+        return float(np.linalg.norm(pa - pb, axis=1).mean()) if len(pa) >= 4 else float("inf")
+
+    def _blend(self, H_pred: np.ndarray, H_obs: np.ndarray, w_pred: float) -> np.ndarray:
+        """Média ponderada das duas homografias, feita no espaço do campo sobre pontos de referência."""
+        img, pa, pb = self._ref_pairs(H_pred, H_obs)
+        if len(img) < 6:
+            return H_obs
+        H, _ = cv2.findHomography(img, w_pred * pa + (1 - w_pred) * pb, 0)
+        if H is None or not np.isfinite(H).all():
+            return H_obs
+        return self._normalize(H)
 
     def to_pitch(self, pts: np.ndarray) -> np.ndarray | None:
         """Converte pontos (N, 2) em px para metros no campo; None sem homografia."""
@@ -664,8 +940,64 @@ def anchor_points(det: Detections, names: list[str]) -> np.ndarray:
     return np.stack([(x1 + x2) / 2, np.where(is_ball, (y1 + y2) / 2, y2)], axis=1).astype(np.float32)
 
 
+def pitch_lines() -> list[np.ndarray]:
+    """Linhas do campo de referência (m) como polilinhas densas, para desenhar na imagem."""
+    L, W = PITCH_LENGTH, PITCH_WIDTH
+
+    def seg(a, b, n=24):
+        return np.linspace(a, b, n)
+
+    def poly(*pts):
+        return np.concatenate([seg(pts[i], pts[i + 1]) for i in range(len(pts) - 1)])
+
+    def arc(c, r, t0, t1, n=48):
+        t = np.linspace(t0, t1, n)
+        return np.stack([c[0] + r * np.cos(t), c[1] + r * np.sin(t)], 1)
+
+    pb1, pb2 = (W - PENALTY_BOX_W) / 2, (W + PENALTY_BOX_W) / 2
+    gb1, gb2 = (W - GOAL_BOX_W) / 2, (W + GOAL_BOX_W) / 2
+    t = np.arccos((PENALTY_BOX_L - PENALTY_SPOT) / CENTRE_CIRCLE_R)  # meia-lua fora da área
+    return [
+        poly((0, 0), (L, 0), (L, W), (0, W), (0, 0)),
+        seg((L / 2, 0), (L / 2, W)),
+        arc((L / 2, W / 2), CENTRE_CIRCLE_R, 0, 2 * np.pi, 96),
+        poly((0, pb1), (PENALTY_BOX_L, pb1), (PENALTY_BOX_L, pb2), (0, pb2)),
+        poly((L, pb1), (L - PENALTY_BOX_L, pb1), (L - PENALTY_BOX_L, pb2), (L, pb2)),
+        poly((0, gb1), (GOAL_BOX_L, gb1), (GOAL_BOX_L, gb2), (0, gb2)),
+        poly((L, gb1), (L - GOAL_BOX_L, gb1), (L - GOAL_BOX_L, gb2), (L, gb2)),
+        arc((PENALTY_SPOT, W / 2), CENTRE_CIRCLE_R, -t, t),
+        arc((L - PENALTY_SPOT, W / 2), CENTRE_CIRCLE_R, np.pi - t, np.pi + t),
+    ]
+
+
+PITCH_LINES = pitch_lines()
+# Cor (BGR) das linhas projetadas conforme a origem da homografia no quadro
+PITCH_SOURCE_COLORS = {"obs": (0, 255, 0), "fused": (0, 255, 0), "partial": (255, 255, 0),
+                       "flow": (0, 220, 255), "hold": (0, 0, 255)}
+
+
 def draw_pitch_keypoints(img: np.ndarray, mapper: PitchMapper) -> None:
-    """Marca os pontos-chave do campo usados na homografia (para conferir o modelo)."""
+    """Marca os pontos-chave do campo e desenha as linhas do campo projetadas pela homografia.
+
+    Linhas verdes = homografia observada neste quadro, ciano = fluxo corrigido por
+    poucos pontos, amarelas = só fluxo óptico, vermelhas = homografia antiga mantida. Se não coincidirem com as linhas do
+    gramado, a homografia está errada.
+    """
+    if mapper.H is not None:
+        Hi = np.linalg.inv(mapper.H)
+        color = PITCH_SOURCE_COLORS.get(mapper.source, (255, 255, 255))
+        th = max(1, img.shape[0] // 540)
+        for line in PITCH_LINES:
+            p, z = project_h(Hi, line)
+            ok = (z > 0) & np.isfinite(p).all(1) & (np.abs(p) < 1e5).all(1)
+            # quebra a polilinha onde há pontos inválidos (além do horizonte)
+            for run in np.split(np.arange(len(p)), np.flatnonzero(~ok)):
+                run = run[ok[run]]
+                if len(run) >= 2:
+                    cv2.polylines(img, [p[run].round().astype(np.int32)], False, color, th, cv2.LINE_AA)
+        cv2.putText(img, f"homografia: {mapper.source}" + (f" ({mapper.rejected})" if mapper.rejected else ""),
+                    (20, img.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, max(0.6, img.shape[0] / 1800),
+                    color, max(1, th), cv2.LINE_AA)
     r = max(3, img.shape[0] // 270)
     for i in np.flatnonzero(mapper.kp_mask):
         x, y = map(int, mapper.kp_xy[i])
@@ -977,6 +1309,7 @@ CSV_FIELDS = ["frame", "timestamp", "class_id", "class_name", "confidence",
 POSSESSION_FIELDS = ["frame", "timestamp", "ball_detected", "team_near_ball", "possession_team",
                      "seconds_A", "seconds_B", "pct_A", "pct_B"]
 PITCH_FIELDS = ["frame", "timestamp", "keypoints", "homography", "fresh",
+                "source", "inliers", "reproj_m", "jump_m", "rejected",
                 *[f"h{r}{c}" for r in (1, 2, 3) for c in (1, 2, 3)]]
 
 
@@ -1059,7 +1392,10 @@ def run(args: argparse.Namespace, detector=None) -> dict:
     mapper, pitch_path = None, None
     if args.pitch:
         kp_model = PitchKeypointModel(args.pitch_weights, args.device, args.pitch_imgsz)
-        mapper = PitchMapper(kp_model, args.pitch_kp_conf, args.pitch_max_age)
+        mapper = PitchMapper(kp_model, args.pitch_kp_conf, args.pitch_max_age,
+                             ransac_thr=args.pitch_ransac_thr, max_reproj=args.pitch_max_reproj,
+                             max_jump=args.pitch_max_jump, smooth=args.pitch_smooth,
+                             flow=not args.no_pitch_flow, flow_max_age=args.pitch_flow_max_age)
         pitch_path = out_dir / f"{stem}_pitch.csv"
     speed_filter = None
     if mapper and args.max_speed > 0:
@@ -1091,6 +1427,7 @@ def run(args: argparse.Namespace, detector=None) -> dict:
     if pitch_writer:
         pitch_writer.writeheader()
     pitch_frames_ok = 0
+    pitch_sources: Counter[str] = Counter()
 
     def fmt(v) -> float | str:
         return round(float(v), 2) if np.isfinite(v) else ""
@@ -1153,14 +1490,18 @@ def run(args: argparse.Namespace, detector=None) -> dict:
                 ts = idx / fps
                 pitch_pts = None
                 if mapper:
-                    mapper.update(frame, dt)
+                    mapper.update(frame, dt, det.xyxy)
                     pitch_pts = mapper.to_pitch(anchor_points(det, names))
                     pitch_frames_ok += mapper.valid
+                    pitch_sources[mapper.source] += 1
                     Hm = [float(v) for v in mapper.H.ravel()] if mapper.valid else [""] * 9
                     pitch_writer.writerow({
                         "frame": idx, "timestamp": round(ts, 3), "keypoints": mapper.n_points,
                         "homography": int(mapper.valid), "fresh": int(mapper.fresh),
-                        **dict(zip(PITCH_FIELDS[5:], Hm)),
+                        "source": mapper.source, "inliers": mapper.n_inliers,
+                        "reproj_m": fmt(mapper.reproj), "jump_m": fmt(mapper.jump),
+                        "rejected": mapper.rejected,
+                        **dict(zip(PITCH_FIELDS[10:], Hm)),
                     })
                 if tracker:
                     near = tracker.update(det, last_teams, names, dt)
@@ -1232,7 +1573,9 @@ def run(args: argparse.Namespace, detector=None) -> dict:
         ratio = pitch_frames_ok / max(frames_done, 1)
         print(f"\nHomografia do campo (CSV: {pitch_path}): {pitch_frames_ok}/{frames_done} "
               f"quadros ({100 * ratio:.0f}%)")
-        pitch = {"frames_ok": pitch_frames_ok, "ratio": ratio, "csv": str(pitch_path)}
+        src_counts = dict(sorted(pitch_sources.items()))
+        print("  origem: " + ", ".join(f"{k}={v}" for k, v in src_counts.items()))
+        pitch = {"frames_ok": pitch_frames_ok, "ratio": ratio, "csv": str(pitch_path), "sources": src_counts}
         if speed_filter:
             sf = speed_filter
             print(f"Filtro de velocidade (> {args.max_speed:g} m/s): {sf.n_checked} posições de atletas, "
@@ -1286,7 +1629,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pitch-kp-conf", type=float, default=0.5,
                    help="confiança mínima de cada ponto do campo (padrão 0.5)")
     p.add_argument("--pitch-max-age", type=float, default=0.5,
-                   help="segundos que a última homografia vale quando faltam pontos (padrão 0.5)")
+                   help="segundos que a última homografia vale quando faltam pontos e o fluxo óptico falha (padrão 0.5)")
+    p.add_argument("--pitch-ransac-thr", type=float, default=2.0,
+                   help="tolerância do RANSAC dos pontos do campo, em metros (padrão 2.0)")
+    p.add_argument("--pitch-max-reproj", type=float, default=2.0,
+                   help="erro médio de reprojeção máx. dos pontos usados, em metros (padrão 2.0)")
+    p.add_argument("--pitch-max-jump", type=float, default=3.0,
+                   help="diferença máx. (m) entre a homografia observada e a prevista pelo movimento "
+                        "da câmera; acima disso a observação é descartada (padrão 3)")
+    p.add_argument("--pitch-smooth", type=float, default=0.5,
+                   help="peso da previsão pelo fluxo óptico na fusão com a observação "
+                        "(0 = só observação, padrão 0.5)")
+    p.add_argument("--pitch-flow-max-age", type=float, default=10.0,
+                   help="segundos que a homografia segue só pelo fluxo óptico sem observação válida (padrão 10)")
+    p.add_argument("--no-pitch-flow", action="store_true",
+                   help="não estima o movimento da câmera por fluxo óptico")
     p.add_argument("--pitch-show-keypoints", action="store_true",
                    help="desenha no vídeo os pontos do campo detectados")
     p.add_argument("--no-radar", action="store_true", help="não desenha o minimapa do campo")
